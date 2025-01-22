@@ -1,0 +1,8 @@
+*** ml rover project ideas
+- computer vision projects --> object detection
+- driving behavior cloning
+- autonomous navigation with deep reinforcement learning
+- visual SLAM (simultaneous localization and mapping)
+- voice command navigation
+- dynamic path planning
+- imitation learning with style transfer --> aggressive, cautious, smooth
