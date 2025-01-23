@@ -15,3 +15,5 @@ test_dataset = load_dataset('coco_detection', 'train')
 # Load the feature extractor
 feature_extractor = AutoFeatureExtractor.from_pretrained('facebook/detr-resnet-50')
 
+# Print an example
+print(f"First image: {dataset['train'][0]}")
