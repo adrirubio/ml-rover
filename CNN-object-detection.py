@@ -9,8 +9,8 @@ import matplotlib as plt
 from datetime import datetime
 
 # Load COCO dataset
-train_dataset = load_dataset('coco_detection', 'train')
-test_dataset = load_dataset('coco_detection', 'train')
+train_dataset = load_dataset("detection-datasets/coco", split="train")
+test_dataset = load_dataset("detection-datasets/coco", split="validation")
 
 # Load the feature extractor
 feature_extractor = AutoFeatureExtractor.from_pretrained('facebook/detr-resnet-50')
