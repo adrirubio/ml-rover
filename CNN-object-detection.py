@@ -13,6 +13,18 @@ from torchvision import transforms
 train_dataset = load_dataset("detection-datasets/coco", split="train")
 test_dataset = load_dataset("detection-datasets/coco", split="validation")
 
+# Transformations
+transform = torchvision.transforms.Compose([
+    transforms.RandomCrop(32, padding=4),
+    torchvision.transforms.RandomHorizontalFlip(p=0.5),
+    torchvision.transforms.RandomAffine(0, translate=(0.1, 0.1)),
+    transforms.ToTensor(),
+])
+
+# Apply transformations to the dataset
+train_dataset = train_dataset.with_transform(lambda x: {**x, 'image': transform(x['image'])})
+test_dataset = test_dataset.with_transform(lambda x: {**x, 'image': transform(x['image'])})
+
 # Load the feature extractor
 feature_extractor = AutoFeatureExtractor.from_pretrained('facebook/detr-resnet-50')
 
