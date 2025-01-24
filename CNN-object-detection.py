@@ -13,10 +13,10 @@ train_dataset = load_dataset("detection-datasets/coco", split="train")
 test_dataset = load_dataset("detection-datasets/coco", split="validation")
 
 # Transformations
-transform = torchvision.transforms.Compose([
+transform = transforms.Compose([
     transforms.RandomCrop(32, padding=4),
-    torchvision.transforms.RandomHorizontalFlip(p=0.5),
-    torchvision.transforms.RandomAffine(0, translate=(0.1, 0.1)),
+    transforms.RandomHorizontalFlip(p=0.5),
+    transforms.RandomAffine(0, translate=(0.1, 0.1)),
     transforms.ToTensor(),
 ])
 
@@ -41,4 +41,10 @@ print(f"Number of classes: {K}")
 
 # Data loader
 batch_size = 64
-train_loader = 
+train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
+                                           batch_size=batch_size,
+                                           shuffle=True)
+
+test_loader = torch.utils.data.DataLoader(dataset=test_dataset,
+                                          batch_size=batch_size,
+                                          shuffle=True)
