@@ -40,7 +40,7 @@ K = len(classes)
 print(f"Number of classes: {K}")
 
 # Data loader
-batch_size = 64
+batch_size = 8
 train_loader = torch.utils.data.DataLoader(dataset=train_dataset,
                                            batch_size=batch_size,
                                            shuffle=True)
