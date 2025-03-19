@@ -1,0 +1,8 @@
+# SSD Arquitecture
+
+- Model: SSD300
+- Base Network: Modified VGG16
+- Input Resolution: 300×300
+- Feature Maps: 6 scales for multi-scale detection
+- Default Boxes: ~8000 per image
+- Output: Class scores and box offsets for each default box
