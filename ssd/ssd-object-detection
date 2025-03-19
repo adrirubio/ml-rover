@@ -103,7 +103,6 @@ def custom_collate_fn(batch):
         "labels": labels  # List of tensors with different shapes
     }
 
-# Assuming you have train_dataset and val_dataset already defined
 # Map the datasets
 mapped_train_dataset = train_dataset.map(train_mapper)
 mapped_val_dataset = val_dataset.map(val_mapper)
