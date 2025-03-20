@@ -121,3 +121,9 @@ val_loader = DataLoader(
     num_workers=4,
     collate_fn=custom_collate_fn
 )
+
+# Define model 
+class SSD(nn.Module):
+    def __init__(self, num_classes=20):
+        super(SSD, self).__init__()
+        vgg = torchvision.models.vgg16(pretrained=True)
