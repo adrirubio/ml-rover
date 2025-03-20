@@ -40,47 +40,40 @@ val_transforms = A.Compose([
 
 # Function to convert Hugging Face dataset to PyTorch format
 def convert_to_ssd_format(example, transform_fn):
-    # Get original image dimensions before transformation
-    img = example["image"]
-    orig_width, orig_height = img.width, img.height
-    
-    # Apply transforms to image
-    image = transform_fn(img)
+    # Get original image
+    img = np.array(example["image"])  # Albumentations expects numpy arrays
     
     # Get bounding boxes and class labels
     boxes = []
-    labels = []
+    categories = []
     
     for bbox, category in zip(example["objects"]["bbox"], example["objects"]["category"]):
-        # Convert bbox from [x_min, y_min, x_max, y_max] format
-        x_min, y_min, x_max, y_max = bbox
-        
-        # Normalize coordinates (for a 300x300 input)
-        x_min = x_min / orig_width * 300
-        y_min = y_min / orig_height * 300
-        x_max = x_max / orig_width * 300
-        y_max = y_max / orig_height * 300
-        
-        # Ensure coordinates are within bounds
-        x_min = max(0, min(299, x_min))
-        y_min = max(0, min(299, y_min))
-        x_max = max(0, min(299, x_max))
-        y_max = max(0, min(299, y_max))
-        
-        # Normalize to [0,1] for SSD format
-        boxes.append([x_min/300, y_min/300, x_max/300, y_max/300])
-        labels.append(category)
+        # Albumentations expects [x_min, y_min, x_max, y_max] format
+        boxes.append(bbox)
+        categories.append(category)
     
-    # Convert to tensors
-    boxes = torch.tensor(boxes, dtype=torch.float32)
-    labels = torch.tensor(labels, dtype=torch.int64)
+    # Apply transforms to image and bounding boxes
+    transformed = transform_fn(image=img, bboxes=boxes, category=categories)
+    
+    # Extract transformed data
+    image = transformed['image']  # Already a tensor from ToTensor
+    transformed_boxes = transformed['bboxes']
+    transformed_categories = transformed['category']
+    
+    # Convert to tensors (boxes already normalized by Albumentations)
+    if transformed_boxes:  # Check if any boxes remain after transform
+        boxes = torch.tensor(transformed_boxes, dtype=torch.float32)
+        labels = torch.tensor(transformed_categories, dtype=torch.int64)
+    else:
+        # Handle case where all boxes were removed by transform
+        boxes = torch.zeros((0, 4), dtype=torch.float32)
+        labels = torch.zeros(0, dtype=torch.int64)
     
     return {
         "image": image,
         "boxes": boxes,
         "labels": labels
     }
-
 # Create dataset mappers
 def train_mapper(example):
     return convert_to_ssd_format(example, train_transforms)
