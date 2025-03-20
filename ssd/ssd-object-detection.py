@@ -127,3 +127,56 @@ class SSD(nn.Module):
     def __init__(self, num_classes=20):
         super(SSD, self).__init__()
         vgg = torchvision.models.vgg16(pretrained=True)
+        features = list(vgg.features.children())
+
+        # First feature map (38x38)
+        self.conv1 = nn.Sequential(
+            *features[:16],  # First 16 layers of VGG
+            nn.BatchNorm2d(512)
+        )
+
+        # Second feature map (19x19)
+        self.conv2 = nn.Sequential(
+            *features[16:23],
+            nn.BatchNorm2d(512)
+        )
+
+        # Additional convolution layers (10x10)
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(512, 256, kernel_size=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+
+        # (5x5)
+        self.conv4 = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+
+        # (3x3)
+        self.conv5 = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
+
+        # (1x1)
+        self.conv6 = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=2),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+        )
