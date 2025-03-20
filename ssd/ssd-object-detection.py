@@ -1,10 +1,12 @@
-# CNN
+# SSD
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 from transformers import AutoFeatureExtractor, AutoModelForObjectDetection
 from datasets import load_dataset
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 import numpy as np
 import matplotlib as plt
 from datetime import datetime
@@ -18,20 +20,23 @@ train_dataset = voc_dataset["train"]
 val_dataset = voc_dataset["validation"]
 
 # Define transforms for training data
-train_transforms = transforms.Compose([
-    transforms.RandomHorizontalFlip(),
-    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1),
-    transforms.Resize((300, 300)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+train_transforms = A.Compose([
+    A.RandomSizedBBoxSafeCrop(height=300, width=300, p=0.5),
+    A.HorizontalFlip(p=0.5),
+    A.RandomBrightnessContrast(p=0.2),
+    A.RGBShift(p=0.2),
+    A.HueSaturationValue(p=0.2),
+    A.Resize(height=300, width=300),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category']))
 
-# Define transforms for validation data
-val_transforms = transforms.Compose([
-    transforms.Resize((300, 300)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+# Validation transforms with Albumentations
+val_transforms = A.Compose([
+    A.Resize(height=300, width=300),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category']))
 
 # Function to convert Hugging Face dataset to PyTorch format
 def convert_to_ssd_format(example, transform_fn):
