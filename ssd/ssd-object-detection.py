@@ -213,3 +213,9 @@ class SSD(nn.Module):
         
         self.default_boxes = torch.FloatTensor(self.default_boxes)  # Convert to tensor
         self.default_boxes.clamp_(0, 1)  # Clip to [0,1] 
+
+# Freeze first 10 layers of the VGG backbone
+for idx, param in enumerate(model.conv1.parameters()):
+    layer_idx = idx // 2  # Each layer has weights and biases, so divide by 2
+    if layer_idx < 10:    # First 10 layers
+        param.requires_grad = False
