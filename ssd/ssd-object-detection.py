@@ -127,7 +127,7 @@ val_loader = DataLoader(
 class SSD(nn.Module):
     def __init__(self, num_classes=20):
         super(SSD, self).__init__()
-        vgg = torchvision.models.vgg16(pretrained=True)
+        vgg = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
         features = list(vgg.features.children())
 
         # First feature map (38x38)
@@ -181,3 +181,35 @@ class SSD(nn.Module):
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
         )
+
+        # Define anchor box configurations for each feature map
+        self.feature_maps = [38, 19, 10, 5, 3, 1]  # sizes of feature maps
+        self.steps = [8, 16, 32, 64, 100, 300]  # effective stride for each feature map
+        self.scales = [0.1, 0.2, 0.37, 0.54, 0.71, 0.88, 1.05]  # anchor box scales
+        self.aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]  # aspect ratios for each feature map
+        
+        # Generate default boxes
+        self.default_boxes = []
+        for k, f in enumerate(self.feature_maps): # k=feature map index f=the size of the feature map
+            for i in range(f):
+                for j in range(f):
+                    cx = (j + 0.5) / f
+                    cy = (i + 0.5) / f
+                    
+                    # Aspect ratio: 1
+                    s = self.scales[k]
+                    self.default_boxes.append([cx, cy, s, s])
+                    
+                    # Additional scale for aspect ratio 1
+                    s_prime = np.sqrt(s * self.scales[k + 1]) if k < len(self.feature_maps) - 1 else 1
+                    self.default_boxes.append([cx, cy, s_prime, s_prime])
+                    
+                    # Other aspect ratios
+                    for ar in self.aspect_ratios[k]:
+                        self.default_boxes.extend([
+                            [cx, cy, s * np.sqrt(ar), s / np.sqrt(ar)],
+                            [cx, cy, s / np.sqrt(ar), s * np.sqrt(ar)]
+                        ])
+        
+        self.default_boxes = torch.FloatTensor(self.default_boxes)  # Convert to tensor
+        self.default_boxes.clamp_(0, 1)  # Clip to [0,1] 
