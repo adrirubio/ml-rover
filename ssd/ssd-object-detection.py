@@ -193,8 +193,8 @@ class SSD(nn.Module):
         for k, f in enumerate(self.feature_maps): # k=feature map index f=the size of the feature map
             for i in range(f):
                 for j in range(f):
-                    cx = (j + 0.5) / f
-                    cy = (i + 0.5) / f
+                    cx = (j + 0.5) / f # x coordinates
+                    cy = (i + 0.5) / f # y coordinates
                     
                     # Aspect ratio: 1
                     s = self.scales[k]
