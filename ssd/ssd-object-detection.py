@@ -214,6 +214,26 @@ class SSD(nn.Module):
         self.default_boxes = torch.FloatTensor(self.default_boxes)  # Convert to tensor
         self.default_boxes.clamp_(0, 1)  # Clip to [0,1] 
 
+        # Define location layers
+        self.loc_layers = nn.ModuleList([
+            nn.Conv2d(512, 4 * 4, kernel_size=3, padding=1),  # For conv1
+            nn.Conv2d(512, 6 * 4, kernel_size=3, padding=1),  # For conv2
+            nn.Conv2d(256, 6 * 4, kernel_size=3, padding=1),  # For conv3
+            nn.Conv2d(256, 6 * 4, kernel_size=3, padding=1),  # For conv4
+            nn.Conv2d(256, 4 * 4, kernel_size=3, padding=1),  # For conv5
+            nn.Conv2d(256, 4 * 4, kernel_size=3, padding=1)   # For conv6
+        ])
+
+        # Define confidence layers
+        self.conf_layers = nn.ModuleList([
+            nn.Conv2d(512, 4 * num_classes, kernel_size=3, padding=1),  # For conv1
+            nn.Conv2d(512, 6 * num_classes, kernel_size=3, padding=1),  # For conv2
+            nn.Conv2d(256, 6 * num_classes, kernel_size=3, padding=1),  # For conv3
+            nn.Conv2d(256, 6 * num_classes, kernel_size=3, padding=1),  # For conv4
+            nn.Conv2d(256, 4 * num_classes, kernel_size=3, padding=1),  # For conv5
+            nn.Conv2d(256, 4 * num_classes, kernel_size=3, padding=1)   # For conv6
+        ])
+
 # Freeze first 10 layers of the VGG backbone
 for idx, param in enumerate(model.conv1.parameters()):
     layer_idx = idx // 2  # Each layer has weights and biases, so divide by 2
