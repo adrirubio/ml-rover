@@ -234,6 +234,40 @@ class SSD(nn.Module):
             nn.Conv2d(256, 4 * num_classes, kernel_size=3, padding=1)   # For conv6
         ])
 
+    # Forward function
+    def forward(self, x):
+        # Extract feature maps
+        feature_maps = []
+        x = self.conv1(x)
+        feature_maps.append(x)
+        x = self.conv2(x)
+        feature_maps.append(x)
+        x = self.conv3(x)
+        feature_maps.append(x)
+        x = self.conv4(x)
+        feature_maps.append(x)
+        x = self.conv5(x)
+        feature_maps.append(x)
+        x = self.conv6(x)
+        feature_maps.append(x)
+
+        # Apply prediction layers
+        loc_preds = []
+        conf_preds = []
+        for i, feature_map in enumerate(feature_maps):
+            # Predicts bounding box ajustments
+            loc_pred = self.loc_layers[i](feature_map)
+            # Predicts class probabilites
+            conf_pred = self.conf_layers[i](feature_map)
+            loc_preds.append(loc_pred.permute(0, 2, 3, 1).contiguous())
+            conf_preds.append(conf_pred.permute(0, 2, 3, 1).contiguous())
+
+        # Reshape and concatenate predictions
+        loc_preds = torch.cat([o.view(o.size(0), -1) for o in loc_preds], 1)
+        conf_preds = torch.cat([o.view(o.size(0), -1) for o in conf_preds], 1)
+
+        return loc_preds, conf_preds
+
 # Freeze first 10 layers of the VGG backbone
 for idx, param in enumerate(model.conv1.parameters()):
     layer_idx = idx // 2  # Each layer has weights and biases, so divide by 2
