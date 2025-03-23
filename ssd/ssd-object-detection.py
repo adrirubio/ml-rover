@@ -269,8 +269,13 @@ class SSD(nn.Module):
 
         return loc_preds, conf_preds
 
+# Instantiate the SSD model
+num_classes = 20  
+model = SSD(num_classes=num_classes)
+
 # Freeze first 10 layers of the VGG backbone
 for idx, param in enumerate(model.conv1.parameters()):
     layer_idx = idx // 2  # Each layer has weights and biases, so divide by 2
     if layer_idx < 10:    # First 10 layers
         param.requires_grad = False
+
