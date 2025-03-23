@@ -75,6 +75,7 @@ def convert_to_ssd_format(example, transform_fn):
         "boxes": boxes,
         "labels": labels
     }
+
 # Create dataset mappers
 def train_mapper(example):
     return convert_to_ssd_format(example, train_transforms)
