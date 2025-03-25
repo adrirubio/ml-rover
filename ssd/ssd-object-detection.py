@@ -279,3 +279,103 @@ for idx, param in enumerate(model.conv1.parameters()):
     if layer_idx < 10:    # First 10 layers
         param.requires_grad = False
 
+class SSDLoss(nn.Module):
+    def __init__(self):
+        super(SSDLoss, self).__init__()
+        
+        # Jaccard overlap threshold for positive matches
+        self.threshold = 0.5
+        
+        # Hard negative mining ratio (negative:positive)
+        self.neg_pos_ratio = 3
+        
+        # Loss functions
+        self.smooth_l1 = nn.SmoothL1Loss(reduction='none')
+        self.cross_entropy = nn.CrossEntropyLoss(reduction='none')
+    
+    def forward(self, predictions, targets):
+        """
+        Args:
+            predictions: (tuple) Contains:
+                loc_preds: Predicted locations, shape: [batch_size, num_priors, 4]
+                conf_preds: Class predictions, shape: [batch_size, num_priors, num_classes]
+                priors: Default boxes, shape: [num_priors, 4]
+            
+            targets: (dict) Contains:
+                boxes: Ground truth boxes, shape: [batch_size, num_objects, 4]
+                labels: Ground truth labels, shape: [batch_size, num_objects]
+        """
+        loc_preds, conf_preds = predictions
+        batch_size = loc_preds.size(0)
+        num_priors = self.default_boxes.size(0)
+        
+        # Match default boxes with ground truth boxes
+        loc_t = torch.zeros(batch_size, num_priors, 4)
+        conf_t = torch.zeros(batch_size, num_priors, dtype=torch.long)
+        
+        for idx in range(batch_size):
+            truths = targets['boxes'][idx]
+            labels = targets['labels'][idx]
+            
+            if truths.size(0) == 0:  # No objects in image
+                continue
+                
+            # Match default boxes to ground truth using IoU
+            overlaps = self.jaccard_overlap(self.default_boxes, truths)
+            best_truth_overlap, best_truth_idx = overlaps.max(1)
+            
+            # Match each ground truth to the default box with best IoU
+            best_prior_overlap, best_prior_idx = overlaps.max(0)
+            
+            # Ensure each gt matches with its prior of max overlap
+            for j in range(best_prior_idx.size(0)):
+                best_truth_idx[best_prior_idx[j]] = j
+                best_truth_overlap[best_prior_idx[j]] = 2  # ensure this is > threshold
+            
+            # Match objects to default boxes
+            matches = truths[best_truth_idx]
+            conf = labels[best_truth_idx]
+            conf[best_truth_overlap < self.threshold] = 0  # mark background
+            
+            # Encode loc targets
+            loc_t[idx] = encode(matches, self.default_boxes)
+            conf_t[idx] = conf
+        
+        # Move to device
+        loc_t = loc_t.to(device)
+        conf_t = conf_t.to(device)
+        
+        # Localization Loss (Smooth L1)
+        pos = conf_t > 0
+        num_pos = pos.sum(dim=1, keepdim=True)
+        pos_idx = pos.unsqueeze(pos.dim()).expand_as(loc_preds)
+        loc_p = loc_preds[pos_idx].view(-1, 4)
+        loc_t = loc_t[pos_idx].view(-1, 4)
+        loss_l = self.smooth_l1(loc_p, loc_t).sum(1)
+        
+        # Classification Loss (Cross Entropy)
+        batch_conf = conf_preds.view(-1, self.num_classes)
+        loss_c = self.cross_entropy(batch_conf, conf_t.view(-1))
+        
+        # Hard Negative Mining
+        loss_c = loss_c.view(batch_size, -1)
+        loss_c[pos] = 0  # filter out pos boxes
+        _, loss_idx = loss_c.sort(1, descending=True)
+        _, idx_rank = loss_idx.sort(1)
+        num_neg = torch.clamp(self.neg_pos_ratio * num_pos, max=pos.size(1) - 1)
+        neg = idx_rank < num_neg.expand_as(idx_rank)
+        
+        # Calculate final losses
+        pos_idx = pos.unsqueeze(2).expand_as(conf_preds)
+        neg_idx = neg.unsqueeze(2).expand_as(conf_preds)
+        conf_p = conf_preds[(pos_idx + neg_idx).gt(0)].view(-1, self.num_classes)
+        targets_weighted = conf_t[(pos + neg).gt(0)]
+        loss_c = self.cross_entropy(conf_p, targets_weighted)
+        
+        # Total Loss
+        N = num_pos.sum().float()
+        loss_l = loss_l.sum() / N
+        loss_c = loss_c.sum() / N
+        
+        return loss_l + loss_c
+
