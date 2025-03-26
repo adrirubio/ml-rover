@@ -269,16 +269,6 @@ class SSD(nn.Module):
 
         return loc_preds, conf_preds
 
-# Instantiate the SSD model
-num_classes = 20  
-model = SSD(num_classes=num_classes)
-
-# Freeze first 10 layers of the VGG backbone
-for idx, param in enumerate(model.conv1.parameters()):
-    layer_idx = idx // 2  # Each layer has weights and biases, so divide by 2
-    if layer_idx < 10:    # First 10 layers
-        param.requires_grad = False
-
 class SSDLoss(nn.Module):
     def __init__(self):
         super(SSDLoss, self).__init__()
@@ -379,3 +369,24 @@ class SSDLoss(nn.Module):
         
         return loss_l + loss_c
 
+# Instantiate the SSD model
+num_classes = 20  
+model = SSD(num_classes=num_classes)
+
+# Freeze first 10 layers of the VGG backbone
+for idx, param in enumerate(model.conv1.parameters()):
+    layer_idx = idx // 2  # Each layer has weights and biases, so divide by 2
+    if layer_idx < 10:    # First 10 layers
+        param.requires_grad = False
+
+# Define optimizer with lower learning rate in conv 1 and 2 (backbone)
+optimizer = optim.Adam([
+    {'params': model.conv1.parameters(), 'lr': 0.0001, 'weight_decay': 1e-4},  # Lower learning rate
+    {'params': model.conv2.parameters(), 'lr': 0.0001, 'weight_decay': 1e-4},  # Lower learning rate
+    {'params': model.conv3.parameters(), 'lr': 0.001, 'weight_decay': 1e-4},
+    {'params': model.conv4.parameters(), 'lr': 0.001, 'weight_decay': 1e-4},
+    {'params': model.conv5.parameters(), 'lr': 0.001, 'weight_decay': 1e-4},
+    {'params': model.conv6.parameters(), 'lr': 0.001, 'weight_decay': 1e-4},
+    {'params': model.loc_layers.parameters(), 'lr': 0.001, 'weight_decay': 1e-4},
+    {'params': model.conf_layers.parameters(), 'lr': 0.001, 'weight_decay': 1e-4}
+], betas=(0.9, 0.999))
