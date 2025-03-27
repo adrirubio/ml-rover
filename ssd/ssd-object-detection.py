@@ -395,8 +395,6 @@ optimizer = optim.Adam([
     {'params': model.conf_layers.parameters(), 'lr': 0.001, 'weight_decay': 1e-4}
 ], betas=(0.9, 0.999))
 
-// ... existing code ...
-
 # Training loop
 def batch_gd(SSD, SSD_loss, optimizer, train_loader, val_loader, epochs):
     train_losses = np.zeros(epochs)
@@ -471,3 +469,10 @@ def batch_gd(SSD, SSD_loss, optimizer, train_loader, val_loader, epochs):
 
 train_losses, val_losses = batch_gd(
     model, criterion, optimizer, train_loader, val_loader, epochs=35)
+
+# Loss train and test loss
+plt.plot(train_losses, label='train loss')
+plt.plot(test_losses, label='test loss')
+plt.legend()
+plt.show()
+
