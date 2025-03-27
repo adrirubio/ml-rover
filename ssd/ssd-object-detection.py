@@ -12,6 +12,7 @@ import numpy as np
 import matplotlib as plt
 from datetime import datetime
 from torchvision import transforms
+from datetime import datetime
 
 # Load PASCAL VOC 2007 - both train and validation sets
 voc_dataset = load_dataset("detection-datasets/pascal-voc", "detection-datasets--pascal-voc")
@@ -110,7 +111,7 @@ mapped_val_dataset = val_dataset.map(val_mapper)
 # Create DataLoaders
 train_loader = DataLoader(
     mapped_train_dataset, 
-    batch_size=64, 
+    batch_size=16, 
     shuffle=True, 
     num_workers=4,  # Using 4 parallel workers
     collate_fn=custom_collate_fn  
@@ -118,7 +119,7 @@ train_loader = DataLoader(
 
 val_loader = DataLoader(
     mapped_val_dataset, 
-    batch_size=64, 
+    batch_size=16, 
     shuffle=False, 
     num_workers=4,
     collate_fn=custom_collate_fn
@@ -373,6 +374,9 @@ class SSDLoss(nn.Module):
 num_classes = 20  
 model = SSD(num_classes=num_classes)
 
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
 # Freeze first 10 layers of the VGG backbone
 for idx, param in enumerate(model.conv1.parameters()):
     layer_idx = idx // 2  # Each layer has weights and biases, so divide by 2
@@ -390,3 +394,80 @@ optimizer = optim.Adam([
     {'params': model.loc_layers.parameters(), 'lr': 0.001, 'weight_decay': 1e-4},
     {'params': model.conf_layers.parameters(), 'lr': 0.001, 'weight_decay': 1e-4}
 ], betas=(0.9, 0.999))
+
+// ... existing code ...
+
+# Training loop
+def batch_gd(SSD, SSD_loss, optimizer, train_loader, val_loader, epochs):
+    train_losses = np.zeros(epochs)
+    val_losses = np.zeros(epochs)
+    
+    for it in range(epochs):
+        SSD.train()
+        t0 = datetime.now()
+        train_loss = []
+
+        for batch in train_loader:
+            images = batch['images']
+            boxes = batch['boxes']
+            labels = batch['labels']
+            
+            # Move data to the appropriate device
+            images = images.to(device)
+            boxes = [b.to(device) for b in boxes]
+            labels = [l.to(device) for l in labels]
+
+            # Zero the parameter gradients
+            optimizer.zero_grad()
+            
+            # Forward pass
+            loc_preds, conf_preds = SSD(images)
+            
+            # Compute loss
+            loss = SSD_loss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
+            
+            # Backward pass and optimize
+            loss.backward()
+            optimizer.step()
+
+            train_loss.append(loss.item())
+        
+        # Get train loss mean
+        train_loss = np.mean(train_loss)
+
+        SSD.eval()
+        val_loss = []
+        with torch.no_grad():
+            for batch in val_loader:
+                images = batch['images']
+                boxes = batch['boxes']
+                labels = batch['labels']
+                
+                # Move data to the appropriate device
+                images = images.to(device)
+                boxes = [b.to(device) for b in boxes]
+                labels = [l.to(device) for l in labels]
+                
+                # Forward pass
+                loc_preds, conf_preds = SSD(images)
+                
+                # Compute loss
+                loss = SSD_loss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
+
+                val_loss.append(loss.item())
+        
+        # Get validation loss mean
+        val_loss = np.mean(val_loss)
+
+        # Save losses
+        train_losses[it] = train_loss
+        val_losses[it] = val_loss
+
+        dt = datetime.now() - t0
+        print(f'Epoch {it+1}/{epochs}, Train Loss: {train_loss:.4f}, \
+            Validation Loss: {val_loss:.4f}, Duration: {dt}')
+
+    return train_losses, val_losses
+
+train_losses, val_losses = batch_gd(
+    model, criterion, optimizer, train_loader, val_loader, epochs=35)
