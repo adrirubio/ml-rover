@@ -442,12 +442,12 @@ optimizer = optim.Adam([
 ], betas=(0.9, 0.999))
 
 # Training loop
-def batch_gd(SSD, SSDLoss, optimizer, train_loader, val_loader, epochs):
+def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
     train_losses = np.zeros(epochs)
     val_losses = np.zeros(epochs)
     
     for it in range(epochs):
-        SSD.train()
+        model.train()
         t0 = datetime.now()
         train_loss = []
 
@@ -479,7 +479,7 @@ def batch_gd(SSD, SSDLoss, optimizer, train_loader, val_loader, epochs):
         # Get train loss mean
         train_loss = np.mean(train_loss)
 
-        SSD.eval()
+        model.eval()
         val_loss = []
         with torch.no_grad():
             for batch in val_loader:
