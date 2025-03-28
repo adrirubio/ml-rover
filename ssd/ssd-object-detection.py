@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
 from transformers import AutoFeatureExtractor, AutoModelForObjectDetection
@@ -9,9 +10,7 @@ from datasets import load_dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import numpy as np
-import matplotlib as plt
-from datetime import datetime
-from torchvision import transforms
+import matplotlib.pyplot as plt
 from datetime import datetime
 
 # Load PASCAL VOC 2007 - both train and validation sets
@@ -50,9 +49,12 @@ def convert_to_ssd_format(example, transform_fn):
     categories = []
     
     for bbox, category in zip(example["objects"]["bbox"], example["objects"]["category"]):
-        # Albumentations expects [x_min, y_min, x_max, y_max] format
-        boxes.append(bbox)
+        x_min, y_min, width, height = bbox
+        x_max = x_min + width
+        y_max = y_min + height
+        boxes.append([x_min, y_min, x_max, y_max])
         categories.append(category)
+
     
     # Apply transforms to image and bounding boxes
     transformed = transform_fn(image=img, bboxes=boxes, category=categories)
@@ -105,29 +107,29 @@ def custom_collate_fn(batch):
     }
 
 # Map the datasets
-mapped_train_dataset = train_dataset.map(train_mapper)
-mapped_val_dataset = val_dataset.map(val_mapper)
+mapped_train_dataset = train_dataset.map(train_mapper, remove_columns=["image", "objects"])
+mapped_val_dataset = val_dataset.map(val_mapper, remove_columns=["image", "objects"])
 
 # Create DataLoaders
 train_loader = DataLoader(
     mapped_train_dataset, 
     batch_size=16, 
     shuffle=True, 
-    num_workers=4,  # Using 4 parallel workers
+    num_workers=2,  # Using 2 parallel workers
     collate_fn=custom_collate_fn  
-)
+)   
 
 val_loader = DataLoader(
     mapped_val_dataset, 
     batch_size=16, 
     shuffle=False, 
-    num_workers=4,
+    num_workers=2,
     collate_fn=custom_collate_fn
 )
 
 # Define model 
 class SSD(nn.Module):
-    def __init__(self, num_classes=20):
+    def __init__(self, num_classes=21):
         super(SSD, self).__init__()
         vgg = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
         features = list(vgg.features.children())
@@ -270,39 +272,105 @@ class SSD(nn.Module):
 
         return loc_preds, conf_preds
 
-class SSDLoss(nn.Module):
-    def __init__(self):
-        super(SSDLoss, self).__init__()
+# Instantiate the SSD model
+num_classes = 21
+model = SSD(num_classes=num_classes)
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+def box_iou(boxes1, boxes2):
+    """
+    Compute Intersection over Union (IoU) between two sets of boxes.
+    
+    Args:
+        boxes1 (torch.Tensor): Shape (N, 4)
+        boxes2 (torch.Tensor): Shape (M, 4)
+    
+    Returns:
+        torch.Tensor: IoU matrix of shape (N, M)
+    """
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+    
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N, M, 2]
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N, M, 2]
+    
+    wh = (rb - lt).clamp(min=0)  # [N, M, 2]
+    inter = wh[:, :, 0] * wh[:, :, 1]  # [N, M]
+    
+    union = area1[:, None] + area2 - inter  # [N, M]
+    
+    return inter / union  # IoU
+
+def encode_boxes(matched_boxes, default_boxes):
+    """
+    Encode ground truth boxes relative to default boxes.
+    
+    Args:
+        matched_boxes (torch.Tensor): Ground truth boxes (N, 4)
+        default_boxes (torch.Tensor): Default anchor boxes (N, 4)
+    
+    Returns:
+        torch.Tensor: Encoded box locations
+    """
+    def box_to_centerwidth(boxes):
+        width = boxes[:, 2] - boxes[:, 0]
+        height = boxes[:, 3] - boxes[:, 1]
+        ctr_x = boxes[:, 0] + width / 2
+        ctr_y = boxes[:, 1] + height / 2
+        return torch.stack([ctr_x, ctr_y, width, height], dim=1)
+    
+    g_cxcy = box_to_centerwidth(matched_boxes)
+    d_cxcy = box_to_centerwidth(default_boxes)
+    
+    encoded_boxes = torch.zeros_like(g_cxcy)
+    encoded_boxes[:, :2] = (g_cxcy[:, :2] - d_cxcy[:, :2]) / (d_cxcy[:, 2:] + 1e-8)
+    encoded_boxes[:, 2:] = torch.log(g_cxcy[:, 2:] / (d_cxcy[:, 2:] + 1e-8))
+    
+    return encoded_boxes
+
+class SSD_loss(nn.Module):
+    def __init__(self, num_classes, default_boxes, device):
+        """
+        SSD Loss function
+
+        Args:
+            num_classes (int): Number of object classes
+            default_boxes (torch.Tensor): Default anchor boxes
+            device (torch.device): GPU or CPU
+        """
+        super(SSD_loss, self).__init__()
         
-        # Jaccard overlap threshold for positive matches
-        self.threshold = 0.5
+        self.num_classes = num_classes
+        self.default_boxes = default_boxes.to(device)
+        self.device = device
         
-        # Hard negative mining ratio (negative:positive)
-        self.neg_pos_ratio = 3
+        self.threshold = 0.5  # IoU threshold for positive matches
+        self.neg_pos_ratio = 3  # Ratio of negative to positive samples
         
-        # Loss functions
         self.smooth_l1 = nn.SmoothL1Loss(reduction='none')
         self.cross_entropy = nn.CrossEntropyLoss(reduction='none')
     
     def forward(self, predictions, targets):
         """
+        Compute SSD loss.
+
         Args:
-            predictions: (tuple) Contains:
-                loc_preds: Predicted locations, shape: [batch_size, num_priors, 4]
-                conf_preds: Class predictions, shape: [batch_size, num_priors, num_classes]
-                priors: Default boxes, shape: [num_priors, 4]
-            
-            targets: (dict) Contains:
-                boxes: Ground truth boxes, shape: [batch_size, num_objects, 4]
-                labels: Ground truth labels, shape: [batch_size, num_objects]
+            predictions (tuple): (loc_preds, conf_preds)
+                - loc_preds: Shape (batch_size, num_priors, 4) (Predicted box offsets)
+                - conf_preds: Shape (batch_size, num_priors, num_classes) (Class probabilities)
+            targets (dict): {"boxes": [list of GT boxes], "labels": [list of GT labels]}
+        
+        Returns:
+            torch.Tensor: Total loss
         """
         loc_preds, conf_preds = predictions
         batch_size = loc_preds.size(0)
         num_priors = self.default_boxes.size(0)
         
-        # Match default boxes with ground truth boxes
-        loc_t = torch.zeros(batch_size, num_priors, 4)
-        conf_t = torch.zeros(batch_size, num_priors, dtype=torch.long)
+        loc_t = torch.zeros(batch_size, num_priors, 4).to(self.device)
+        conf_t = torch.zeros(batch_size, num_priors, dtype=torch.long).to(self.device)
         
         for idx in range(batch_size):
             truths = targets['boxes'][idx]
@@ -310,72 +378,50 @@ class SSDLoss(nn.Module):
             
             if truths.size(0) == 0:  # No objects in image
                 continue
-                
-            # Match default boxes to ground truth using IoU
-            overlaps = self.jaccard_overlap(self.default_boxes, truths)
-            best_truth_overlap, best_truth_idx = overlaps.max(1)
             
-            # Match each ground truth to the default box with best IoU
-            best_prior_overlap, best_prior_idx = overlaps.max(0)
+            overlaps = box_iou(self.default_boxes, truths)
+            best_truth_overlap, best_truth_idx = overlaps.max(1)  
             
-            # Ensure each gt matches with its prior of max overlap
+            best_prior_overlap, best_prior_idx = overlaps.max(0)  
             for j in range(best_prior_idx.size(0)):
                 best_truth_idx[best_prior_idx[j]] = j
-                best_truth_overlap[best_prior_idx[j]] = 2  # ensure this is > threshold
+                best_truth_overlap[best_prior_idx[j]] = 2  
+
+            matches = truths[best_truth_idx]  
+            conf = labels[best_truth_idx]  
+            conf[best_truth_overlap < self.threshold] = 0  
             
-            # Match objects to default boxes
-            matches = truths[best_truth_idx]
-            conf = labels[best_truth_idx]
-            conf[best_truth_overlap < self.threshold] = 0  # mark background
-            
-            # Encode loc targets
-            loc_t[idx] = encode(matches, self.default_boxes)
+            loc_t[idx] = encode_boxes(matches, self.default_boxes)
             conf_t[idx] = conf
         
-        # Move to device
-        loc_t = loc_t.to(device)
-        conf_t = conf_t.to(device)
-        
-        # Localization Loss (Smooth L1)
         pos = conf_t > 0
-        num_pos = pos.sum(dim=1, keepdim=True)
-        pos_idx = pos.unsqueeze(pos.dim()).expand_as(loc_preds)
-        loc_p = loc_preds[pos_idx].view(-1, 4)
-        loc_t = loc_t[pos_idx].view(-1, 4)
-        loss_l = self.smooth_l1(loc_p, loc_t).sum(1)
+        loc_loss = self.smooth_l1(loc_preds[pos], loc_t[pos]).sum()
         
-        # Classification Loss (Cross Entropy)
-        batch_conf = conf_preds.view(-1, self.num_classes)
-        loss_c = self.cross_entropy(batch_conf, conf_t.view(-1))
-        
-        # Hard Negative Mining
-        loss_c = loss_c.view(batch_size, -1)
-        loss_c[pos] = 0  # filter out pos boxes
-        _, loss_idx = loss_c.sort(1, descending=True)
+        conf_loss = self.cross_entropy(conf_preds.view(-1, self.num_classes), conf_t.view(-1))
+        conf_loss = conf_loss.view(batch_size, -1)
+        conf_loss[pos] = 0  
+
+        _, loss_idx = conf_loss.sort(1, descending=True)
         _, idx_rank = loss_idx.sort(1)
+        num_pos = pos.long().sum(1)
         num_neg = torch.clamp(self.neg_pos_ratio * num_pos, max=pos.size(1) - 1)
-        neg = idx_rank < num_neg.expand_as(idx_rank)
         
-        # Calculate final losses
-        pos_idx = pos.unsqueeze(2).expand_as(conf_preds)
-        neg_idx = neg.unsqueeze(2).expand_as(conf_preds)
-        conf_p = conf_preds[(pos_idx + neg_idx).gt(0)].view(-1, self.num_classes)
-        targets_weighted = conf_t[(pos + neg).gt(0)]
-        loss_c = self.cross_entropy(conf_p, targets_weighted)
+        neg = idx_rank < num_neg.unsqueeze(1)
         
-        # Total Loss
-        N = num_pos.sum().float()
-        loss_l = loss_l.sum() / N
-        loss_c = loss_c.sum() / N
+        pos_conf_loss = conf_loss[pos].sum()
+        neg_conf_loss = conf_loss[neg].sum()
         
-        return loss_l + loss_c
+        epsilon = 1e-6
+        loss = (loc_loss + pos_conf_loss + neg_conf_loss) / (num_pos.sum().float() + epsilon)
+        
+        return loss
 
-# Instantiate the SSD model
-num_classes = 20  
-model = SSD(num_classes=num_classes)
-
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-model.to(device)
+# Initialize the SSD loss function
+SSDLoss = SSD_loss(
+    num_classes=num_classes, 
+    default_boxes=model.default_boxes, 
+    device=device
+)
 
 # Freeze first 10 layers of the VGG backbone
 for idx, param in enumerate(model.conv1.parameters()):
@@ -396,7 +442,7 @@ optimizer = optim.Adam([
 ], betas=(0.9, 0.999))
 
 # Training loop
-def batch_gd(SSD, SSD_loss, optimizer, train_loader, val_loader, epochs):
+def batch_gd(SSD, SSDLoss, optimizer, train_loader, val_loader, epochs):
     train_losses = np.zeros(epochs)
     val_losses = np.zeros(epochs)
     
@@ -422,7 +468,7 @@ def batch_gd(SSD, SSD_loss, optimizer, train_loader, val_loader, epochs):
             loc_preds, conf_preds = SSD(images)
             
             # Compute loss
-            loss = SSD_loss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
+            loss = SSDLoss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
             
             # Backward pass and optimize
             loss.backward()
@@ -450,7 +496,7 @@ def batch_gd(SSD, SSD_loss, optimizer, train_loader, val_loader, epochs):
                 loc_preds, conf_preds = SSD(images)
                 
                 # Compute loss
-                loss = SSD_loss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
+                loss = SSDLoss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
 
                 val_loss.append(loss.item())
         
@@ -467,12 +513,15 @@ def batch_gd(SSD, SSD_loss, optimizer, train_loader, val_loader, epochs):
 
     return train_losses, val_losses
 
-train_losses, val_losses = batch_gd(
-    model, criterion, optimizer, train_loader, val_loader, epochs=35)
+train_losses, val_losses = batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs=35)
 
 # Loss train and test loss
 plt.plot(train_losses, label='train loss')
-plt.plot(test_losses, label='test loss')
+plt.plot(val_losses, label='test loss')
 plt.legend()
 plt.show()
 
+# Save model
+model_save_path = "ssd-object-detection.pth"
+torch.save(model.state_dict(), model_save_path)
+print(f"Model saved to {model_save_path}")
