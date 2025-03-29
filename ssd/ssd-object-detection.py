@@ -513,7 +513,7 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
 
     return train_losses, val_losses
 
-train_losses, val_losses = batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs=35)
+train_losses, val_losses = batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs=70)
 
 # Loss train and test loss
 plt.plot(train_losses, label='train loss')
