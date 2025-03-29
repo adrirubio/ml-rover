@@ -115,7 +115,7 @@ train_loader = DataLoader(
     mapped_train_dataset, 
     batch_size=16, 
     shuffle=True, 
-    num_workers=2,  # Using 2 parallel workers
+    num_workers=4,  # Using 4 parallel workers
     collate_fn=custom_collate_fn  
 )   
 
@@ -123,7 +123,7 @@ val_loader = DataLoader(
     mapped_val_dataset, 
     batch_size=16, 
     shuffle=False, 
-    num_workers=2,
+    num_workers=4,
     collate_fn=custom_collate_fn
 )
 
@@ -465,7 +465,7 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
             optimizer.zero_grad()
             
             # Forward pass
-            loc_preds, conf_preds = SSD(images)
+            loc_preds, conf_preds = model(images)
             
             # Compute loss
             loss = SSDLoss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
@@ -493,7 +493,7 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
                 labels = [l.to(device) for l in labels]
                 
                 # Forward pass
-                loc_preds, conf_preds = SSD(images)
+                loc_preds, conf_preds = model(images)
                 
                 # Compute loss
                 loss = SSDLoss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
