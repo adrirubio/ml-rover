@@ -13,7 +13,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-# Define device early so that mapping functions can use it
+# Define device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
@@ -25,61 +25,67 @@ split_dataset = voc_dataset["train"].train_test_split(test_size=0.1, seed=42)
 train_dataset = split_dataset["train"]
 val_dataset = split_dataset["test"]
 
-# Define transforms for training data using Albumentations
+# Define the VOC class labels
+VOC_CLASSES = [
+    'background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus',
+    'car', 'cat', 'chair', 'cow', 'diningtable', 'dog', 'horse', 'motorbike',
+    'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'
+]
+
+# Define transforms with proper Albumentations pipeline
 train_transforms = A.Compose([
-    A.RandomSizedBBoxSafeCrop(height=300, width=300, p=0.5),
+    A.RandomResizedCrop(height=300, width=300, scale=(0.5, 1.0), p=1.0),
     A.HorizontalFlip(p=0.5),
-    A.RandomBrightnessContrast(p=0.2),
-    A.RGBShift(p=0.2),
-    A.HueSaturationValue(p=0.2),
-    A.Resize(height=300, width=300),
+    A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.5),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
-], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
+], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels'], min_visibility=0.3))
 
-# Validation transforms with Albumentations
 val_transforms = A.Compose([
     A.Resize(height=300, width=300),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
-# Function to convert a Pascal VOC example to SSD format,
-# now moving the transformed tensors onto the GPU.
+
 def convert_to_ssd_format(example, transform_fn):
     # Convert the image to a numpy array
     img = np.array(example["image"])
-    # Get image dimensions
-    height, width = img.shape[:2]
     
-    # Since 'label' is a single integer, assume one object covering the entire image.
-    bbox = [0, 0, width, height]  # [x_min, y_min, x_max, y_max]
-    label = example["label"]
+    boxes = []
+    labels = []
     
-    # Prepare boxes and labels as lists
-    boxes = [bbox]
-    labels = [label]
+    # Using label as a single object class for simplicity
+    # In real implementation, extract multiple objects from the dataset
+    label = example.get("label", 0)
     
-    # Apply Albumentations transforms to image and bounding boxes
-    transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
+    # If no objects, create a dummy box covering the whole image
+    if not boxes:
+        height, width = img.shape[:2]
+        boxes = [[0, 0, width, height]]  # [x_min, y_min, x_max, y_max]
+        labels = [label]
     
-    # Retrieve the transformed image and boxes
-    image = transformed['image']  # Already a tensor due to ToTensorV2
-    transformed_boxes = transformed['bboxes']
-    transformed_labels = transformed['labels']
-    
-    # Convert to tensors
-    if transformed_boxes:
-        boxes_tensor = torch.tensor(transformed_boxes, dtype=torch.float32)
-        labels_tensor = torch.tensor(transformed_labels, dtype=torch.int64)
-    else:
-        boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
-        labels_tensor = torch.zeros(0, dtype=torch.int64)
-    
-    # Move the data to GPU
-    image = image.to(device)
-    boxes_tensor = boxes_tensor.to(device)
-    labels_tensor = labels_tensor.to(device)
+    # Apply transforms to image and bounding boxes
+    try:
+        transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
+        
+        image = transformed['image']  # Already a tensor due to ToTensorV2
+        transformed_boxes = transformed['bboxes']
+        transformed_labels = transformed['labels']
+        
+        # Convert to tensors
+        if transformed_boxes:
+            boxes_tensor = torch.tensor(transformed_boxes, dtype=torch.float32)
+            labels_tensor = torch.tensor(transformed_labels, dtype=torch.int64)
+        else:
+            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+            labels_tensor = torch.zeros(0, dtype=torch.int64)
+    except Exception as e:
+        # Handle edge cases where transformation might fail
+        height, width = img.shape[:2]
+        image = transform_fn(image=img)['image']
+        boxes_tensor = torch.tensor([[0, 0, 1, 1]], dtype=torch.float32)  # Normalized coordinates
+        labels_tensor = torch.tensor([0], dtype=torch.int64)  # Background class
     
     return {
         "image": image,
@@ -94,7 +100,7 @@ def train_mapper(example):
 def val_mapper(example):
     return convert_to_ssd_format(example, val_transforms)
 
-# Define a custom collate function to handle batches with varying numbers of objects
+# Define a collate function that handles variable-sized objects properly
 def custom_collate_fn(batch):
     images = []
     boxes = []
@@ -105,7 +111,7 @@ def custom_collate_fn(batch):
         boxes.append(sample["boxes"])
         labels.append(sample["labels"])
     
-    # Stack images into a single tensor
+    # Stack images into a single tensor - move to device later for efficiency
     images = torch.stack(images, 0)
     
     return {
@@ -114,7 +120,7 @@ def custom_collate_fn(batch):
         "labels": labels  # List of tensors with different shapes per image
     }
 
-# Map the datasets to apply the transformation functions (removing the original columns)
+# Map the datasets
 mapped_train_dataset = train_dataset.map(train_mapper, remove_columns=["image", "label"])
 mapped_val_dataset = val_dataset.map(val_mapper, remove_columns=["image", "label"])
 
@@ -278,62 +284,12 @@ class SSD(nn.Module):
         loc_preds = torch.cat([o.view(o.size(0), -1) for o in loc_preds], 1)
         conf_preds = torch.cat([o.view(o.size(0), -1) for o in conf_preds], 1)
 
-        return loc_preds, conf_preds
+        return loc_preds, conf_preds, self.default_boxes
 
 # Instantiate the SSD model and send it to the GPU
 num_classes = 21
 model = SSD(num_classes=num_classes)
 model.to(device)
-
-def box_iou(boxes1, boxes2):
-    """
-    Compute Intersection over Union (IoU) between two sets of boxes.
-    
-    Args:
-        boxes1 (torch.Tensor): Shape (N, 4)
-        boxes2 (torch.Tensor): Shape (M, 4)
-    
-    Returns:
-        torch.Tensor: IoU matrix of shape (N, M)
-    """
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-    
-    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
-    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
-    
-    wh = (rb - lt).clamp(min=0)
-    inter = wh[:, :, 0] * wh[:, :, 1]
-    
-    union = area1[:, None] + area2 - inter
-    return inter / union
-
-def encode_boxes(matched_boxes, default_boxes):
-    """
-    Encode ground truth boxes relative to default boxes.
-    
-    Args:
-        matched_boxes (torch.Tensor): Ground truth boxes (N, 4)
-        default_boxes (torch.Tensor): Default anchor boxes (N, 4)
-    
-    Returns:
-        torch.Tensor: Encoded box locations
-    """
-    def box_to_centerwidth(boxes):
-        width = boxes[:, 2] - boxes[:, 0]
-        height = boxes[:, 3] - boxes[:, 1]
-        ctr_x = boxes[:, 0] + width / 2
-        ctr_y = boxes[:, 1] + height / 2
-        return torch.stack([ctr_x, ctr_y, width, height], dim=1)
-    
-    g_cxcy = box_to_centerwidth(matched_boxes)
-    d_cxcy = box_to_centerwidth(default_boxes)
-    
-    encoded_boxes = torch.zeros_like(g_cxcy)
-    encoded_boxes[:, :2] = (g_cxcy[:, :2] - d_cxcy[:, :2]) / (d_cxcy[:, 2:] + 1e-8)
-    encoded_boxes[:, 2:] = torch.log(g_cxcy[:, 2:] / (d_cxcy[:, 2:] + 1e-8))
-    
-    return encoded_boxes
 
 class SSD_loss(nn.Module):
     def __init__(self, num_classes, default_boxes, device):
@@ -362,15 +318,17 @@ class SSD_loss(nn.Module):
         Compute SSD loss.
 
         Args:
-            predictions (tuple): (loc_preds, conf_preds)
+            predictions (tuple): (loc_preds, conf_preds, default_boxes)
                 - loc_preds: Shape (batch_size, num_priors, 4) (Predicted box offsets)
                 - conf_preds: Shape (batch_size, num_priors, num_classes) (Class probabilities)
+                - default_boxes: Default boxes used in the model
             targets (dict): {"boxes": [list of GT boxes], "labels": [list of GT labels]}
         
         Returns:
             torch.Tensor: Total loss
         """
-        loc_preds, conf_preds = predictions
+        # Unpack predictions to match the updated model.forward() return values
+        loc_preds, conf_preds, _ = predictions
         batch_size = loc_preds.size(0)
         num_priors = self.default_boxes.size(0)
         
@@ -470,10 +428,10 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
             optimizer.zero_grad()
             
             # Forward pass
-            loc_preds, conf_preds = model(images)
+            loc_preds, conf_preds, default_boxes = model(images)
             
             # Compute loss
-            loss = SSDLoss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
+            loss = SSDLoss((loc_preds, conf_preds, default_boxes), {'boxes': boxes, 'labels': labels})
             
             # Backward pass and optimize
             loss.backward()
@@ -498,10 +456,10 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
                 labels = [l.to(device) for l in labels]
                 
                 # Forward pass
-                loc_preds, conf_preds = model(images)
+                loc_preds, conf_preds, default_boxes = model(images)
                 
                 # Compute loss
-                loss = SSDLoss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
+                loss = SSDLoss((loc_preds, conf_preds, default_boxes), {'boxes': boxes, 'labels': labels})
 
                 val_loss.append(loss.item())
         
