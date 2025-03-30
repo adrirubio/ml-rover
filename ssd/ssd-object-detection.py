@@ -34,12 +34,12 @@ VOC_CLASSES = [
 
 # Define transforms with proper Albumentations pipeline
 train_transforms = A.Compose([
-    A.RandomResizedCrop(size=(300, 300), scale=(0.5, 1.0), p=1.0),
+    A.Resize(300, 300),  # Simple resize instead of RandomResizedCrop
     A.HorizontalFlip(p=0.5),
     A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.5),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
-], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels'], min_visibility=0.3))
+], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
 val_transforms = A.Compose([
     A.Resize(width=300, height=300),  # For resize, width and height are separate parameters
@@ -122,7 +122,7 @@ mapped_val_dataset = val_dataset.map(
 # Create DataLoaders
 train_loader = DataLoader(
     mapped_train_dataset, 
-    batch_size=16, 
+    batch_size=32, 
     shuffle=True, 
     num_workers=4,  # Using 4 parallel workers
     collate_fn=custom_collate_fn  
@@ -130,7 +130,7 @@ train_loader = DataLoader(
 
 val_loader = DataLoader(
     mapped_val_dataset, 
-    batch_size=16, 
+    batch_size=32, 
     shuffle=False, 
     num_workers=4,
     collate_fn=custom_collate_fn
