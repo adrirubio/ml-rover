@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 # Load the Pascal VOC dataset
-voc_dataset = load_dataset("nateraw/pascal-voc-2012")
+voc_dataset = load_dataset("EduardoLawson1/Pascal_voc")
 
 # Access train and validation splits 
 train_dataset = voc_dataset["train"]
@@ -41,30 +41,24 @@ val_transforms = A.Compose([
 
 # Function to convert a Pascal VOC example to SSD format
 def convert_to_ssd_format(example, transform_fn):
-    # Convert the image to a numpy array (Albumentations expects numpy arrays)
+    # Convert the image to a numpy array
     img = np.array(example["image"])
     
-    # Extract bounding boxes and labels from the dataset
-    boxes = []
-    labels = []
-    for bbox, label in zip(example["objects"]["bbox"], example["objects"]["label"]):
-        # Pascal VOC boxes are provided as [x_min, y_min, width, height]
-        x_min, y_min, width, height = bbox
-        x_max = x_min + width
-        y_max = y_min + height
-        boxes.append([x_min, y_min, x_max, y_max])
-        labels.append(label)
+    # Convert the mask to a numpy array
+    mask = np.array(example["mask"])
+    # Extract bounding boxes and labels from the mask
+    boxes, labels = mask_to_boxes_and_labels(mask)
     
     # Apply Albumentations transforms to the image and bounding boxes
     transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
     
     # Retrieve the transformed image and boxes
-    image = transformed['image']  # Already a tensor due to ToTensorV2
+    image = transformed['image']  # Already a tensor from ToTensorV2
     transformed_boxes = transformed['bboxes']
     transformed_labels = transformed['labels']
     
-    # Convert the transformed bounding boxes and labels to tensors
-    if transformed_boxes:  # Ensure there is at least one bounding box
+    # Convert to tensors
+    if transformed_boxes:
         boxes_tensor = torch.tensor(transformed_boxes, dtype=torch.float32)
         labels_tensor = torch.tensor(transformed_labels, dtype=torch.int64)
     else:
@@ -76,6 +70,7 @@ def convert_to_ssd_format(example, transform_fn):
         "boxes": boxes_tensor,
         "labels": labels_tensor
     }
+
 
 # Create mapping functions for training and validation datasets
 def train_mapper(example):
@@ -105,8 +100,8 @@ def custom_collate_fn(batch):
     }
 
 # Map the datasets to apply the transformation functions (removing the original columns)
-mapped_train_dataset = train_dataset.map(train_mapper, remove_columns=["image", "objects"])
-mapped_val_dataset = val_dataset.map(val_mapper, remove_columns=["image", "objects"])
+mapped_train_dataset = train_dataset.map(train_mapper, remove_columns=["image", "label"])
+mapped_val_dataset = val_dataset.map(val_mapper, remove_columns=["image", "label"])
 
 # Create DataLoaders
 train_loader = DataLoader(
