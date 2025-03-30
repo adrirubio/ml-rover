@@ -44,31 +44,27 @@ val_transforms = A.Compose([
 def convert_to_ssd_format(example, transform_fn):
     # Convert the image to a numpy array
     img = np.array(example["image"])
+    # Get image dimensions
+    height, width = img.shape[:2]
     
-    # Extract bounding boxes and labels from the 'label' column
-    boxes = []
-    labels = []
-    # Assuming each object annotation is a dictionary with keys "bbox" and "label"
-    for obj in example["label"]:
-        bbox = obj["bbox"]
-        label = obj["label"]
-        # Convert Pascal VOC bbox format [x_min, y_min, width, height] to [x_min, y_min, x_max, y_max]
-        x_min, y_min, width, height = bbox
-        x_max = x_min + width
-        y_max = y_min + height
-        boxes.append([x_min, y_min, x_max, y_max])
-        labels.append(label)
+    # Since 'label' is a single integer, assume one object covering the entire image.
+    bbox = [0, 0, width, height]  # [x_min, y_min, x_max, y_max]
+    label = example["label"]
+    
+    # Prepare boxes and labels as lists
+    boxes = [bbox]
+    labels = [label]
     
     # Apply Albumentations transforms to image and bounding boxes
     transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
     
     # Retrieve the transformed image and boxes
-    image = transformed['image']  # Already a tensor from ToTensorV2
+    image = transformed['image']  # Already a tensor due to ToTensorV2
     transformed_boxes = transformed['bboxes']
     transformed_labels = transformed['labels']
     
     # Convert to tensors
-    if transformed_boxes:  # Ensure there's at least one box
+    if transformed_boxes:
         boxes_tensor = torch.tensor(transformed_boxes, dtype=torch.float32)
         labels_tensor = torch.tensor(transformed_labels, dtype=torch.int64)
     else:
@@ -80,7 +76,6 @@ def convert_to_ssd_format(example, transform_fn):
         "boxes": boxes_tensor,
         "labels": labels_tensor
     }
-
 
 # Create mapping functions for training and validation datasets
 def train_mapper(example):
