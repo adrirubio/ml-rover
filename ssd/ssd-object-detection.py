@@ -14,11 +14,11 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 # Load the Pascal VOC dataset
-voc_dataset = load_dataset("merve/pascal-voc")
+voc_dataset = load_dataset("nateraw/pascal-voc-2012")
 
 # Access train and validation splits 
 train_dataset = voc_dataset["train"]
-val_dataset = voc_dataset["validation"]
+val_dataset = voc_dataset["val"]
 
 # Define transforms for training data using Albumentations
 train_transforms = A.Compose([
