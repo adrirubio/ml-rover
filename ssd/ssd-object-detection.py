@@ -202,11 +202,11 @@ class SSD(nn.Module):
         
         # Generate default boxes
         self.default_boxes = []
-        for k, f in enumerate(self.feature_maps):
+        for k, f in enumerate(self.feature_maps): # k=feature map index f=the size of the feature map
             for i in range(f):
                 for j in range(f):
-                    cx = (j + 0.5) / f
-                    cy = (i + 0.5) / f
+                    cx = (j + 0.5) / f # x coordinates
+                    cy = (i + 0.5) / f # y coordinates
                     
                     # Aspect ratio: 1
                     s = self.scales[k]
@@ -246,7 +246,9 @@ class SSD(nn.Module):
             nn.Conv2d(256, 4 * num_classes, kernel_size=3, padding=1)   # For conv6
         ])
 
+    # Forward function
     def forward(self, x):
+        # Extract feature maps
         feature_maps = []
         x = self.conv1(x)
         feature_maps.append(x)
@@ -261,14 +263,18 @@ class SSD(nn.Module):
         x = self.conv6(x)
         feature_maps.append(x)
 
+        # Apply prediction layers
         loc_preds = []
         conf_preds = []
         for i, feature_map in enumerate(feature_maps):
+            # Predicts bounding box ajustments
             loc_pred = self.loc_layers[i](feature_map)
+            # Predicts class probabilites
             conf_pred = self.conf_layers[i](feature_map)
             loc_preds.append(loc_pred.permute(0, 2, 3, 1).contiguous())
             conf_preds.append(conf_pred.permute(0, 2, 3, 1).contiguous())
 
+        # Reshape and concatenate predictions
         loc_preds = torch.cat([o.view(o.size(0), -1) for o in loc_preds], 1)
         conf_preds = torch.cat([o.view(o.size(0), -1) for o in conf_preds], 1)
 
@@ -280,6 +286,16 @@ model = SSD(num_classes=num_classes)
 model.to(device)
 
 def box_iou(boxes1, boxes2):
+    """
+    Compute Intersection over Union (IoU) between two sets of boxes.
+    
+    Args:
+        boxes1 (torch.Tensor): Shape (N, 4)
+        boxes2 (torch.Tensor): Shape (M, 4)
+    
+    Returns:
+        torch.Tensor: IoU matrix of shape (N, M)
+    """
     area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
     area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
     
@@ -293,6 +309,16 @@ def box_iou(boxes1, boxes2):
     return inter / union
 
 def encode_boxes(matched_boxes, default_boxes):
+    """
+    Encode ground truth boxes relative to default boxes.
+    
+    Args:
+        matched_boxes (torch.Tensor): Ground truth boxes (N, 4)
+        default_boxes (torch.Tensor): Default anchor boxes (N, 4)
+    
+    Returns:
+        torch.Tensor: Encoded box locations
+    """
     def box_to_centerwidth(boxes):
         width = boxes[:, 2] - boxes[:, 0]
         height = boxes[:, 3] - boxes[:, 1]
@@ -311,6 +337,14 @@ def encode_boxes(matched_boxes, default_boxes):
 
 class SSD_loss(nn.Module):
     def __init__(self, num_classes, default_boxes, device):
+        """
+        SSD Loss function
+
+        Args:
+            num_classes (int): Number of object classes
+            default_boxes (torch.Tensor): Default anchor boxes
+            device (torch.device): GPU or CPU
+        """
         super(SSD_loss, self).__init__()
         
         self.num_classes = num_classes
@@ -324,6 +358,18 @@ class SSD_loss(nn.Module):
         self.cross_entropy = nn.CrossEntropyLoss(reduction='none')
     
     def forward(self, predictions, targets):
+        """
+        Compute SSD loss.
+
+        Args:
+            predictions (tuple): (loc_preds, conf_preds)
+                - loc_preds: Shape (batch_size, num_priors, 4) (Predicted box offsets)
+                - conf_preds: Shape (batch_size, num_priors, num_classes) (Class probabilities)
+            targets (dict): {"boxes": [list of GT boxes], "labels": [list of GT labels]}
+        
+        Returns:
+            torch.Tensor: Total loss
+        """
         loc_preds, conf_preds = predictions
         batch_size = loc_preds.size(0)
         num_priors = self.default_boxes.size(0)
@@ -384,14 +430,14 @@ SSDLoss = SSD_loss(
 
 # Freeze first 10 layers of the VGG backbone
 for idx, param in enumerate(model.conv1.parameters()):
-    layer_idx = idx // 2
-    if layer_idx < 10:
+    layer_idx = idx // 2  # Each layer has weights and biases, so divide by 2
+    if layer_idx < 10:    # First 10 layers
         param.requires_grad = False
 
 # Define optimizer with lower learning rate in conv 1 and 2 (backbone)
 optimizer = optim.Adam([
-    {'params': model.conv1.parameters(), 'lr': 0.0001, 'weight_decay': 1e-4},
-    {'params': model.conv2.parameters(), 'lr': 0.0001, 'weight_decay': 1e-4},
+    {'params': model.conv1.parameters(), 'lr': 0.0001, 'weight_decay': 1e-4},  # Lower learning rate
+    {'params': model.conv2.parameters(), 'lr': 0.0001, 'weight_decay': 1e-4},  # Lower learning rate
     {'params': model.conv3.parameters(), 'lr': 0.001, 'weight_decay': 1e-4},
     {'params': model.conv4.parameters(), 'lr': 0.001, 'weight_decay': 1e-4},
     {'params': model.conv5.parameters(), 'lr': 0.001, 'weight_decay': 1e-4},
@@ -411,23 +457,31 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
         train_loss = []
 
         for batch in train_loader:
-            images = batch['images']  # already on GPU
+            images = batch['images']
             boxes = batch['boxes']
             labels = batch['labels']
-
-            # (Optional: these .to(device) calls are redundant now)
+            
+            # Move data to the appropriate device
             images = images.to(device)
             boxes = [b.to(device) for b in boxes]
             labels = [l.to(device) for l in labels]
 
+            # Zero the parameter gradients
             optimizer.zero_grad()
+            
+            # Forward pass
             loc_preds, conf_preds = model(images)
+            
+            # Compute loss
             loss = SSDLoss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
+            
+            # Backward pass and optimize
             loss.backward()
             optimizer.step()
 
             train_loss.append(loss.item())
         
+        # Get train loss mean
         train_loss = np.mean(train_loss)
 
         model.eval()
@@ -438,15 +492,23 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
                 boxes = batch['boxes']
                 labels = batch['labels']
                 
+                # Move data to the appropriate device
                 images = images.to(device)
                 boxes = [b.to(device) for b in boxes]
                 labels = [l.to(device) for l in labels]
                 
+                # Forward pass
                 loc_preds, conf_preds = model(images)
+                
+                # Compute loss
                 loss = SSDLoss((loc_preds, conf_preds), {'boxes': boxes, 'labels': labels})
+
                 val_loss.append(loss.item())
         
+        # Get validation loss mean
         val_loss = np.mean(val_loss)
+
+        # Save losses
         train_losses[it] = train_loss
         val_losses[it] = val_loss
 
