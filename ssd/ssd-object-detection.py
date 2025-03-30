@@ -42,7 +42,7 @@ train_transforms = A.Compose([
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels'], min_visibility=0.3))
 
 val_transforms = A.Compose([
-    A.Resize(height=300, width=300),  # Keep using height and width here
+    A.Resize(width=300, height=300),  # For resize, width and height are separate parameters
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
@@ -51,10 +51,13 @@ def convert_to_ssd_format(example, transform_fn):
     # Convert the image to a numpy array
     img = np.array(example["image"])
     
-    # Extract all necessary information
+    # Extract the label - for classification dataset, this is likely a single class label
     label = example.get("label", 0)
+    
+    # For a classification dataset converted to detection format:
+    # Use the whole image as a bounding box and the label as the class
     height, width = img.shape[:2]
-    boxes = [[0, 0, width, height]]  # Default box
+    boxes = [[0, 0, width, height]]  # Default box covering the whole image
     labels = [label]
     
     # Apply transforms to image and bounding boxes
@@ -66,7 +69,7 @@ def convert_to_ssd_format(example, transform_fn):
         boxes_tensor = torch.tensor(transformed['bboxes'], dtype=torch.float32) if transformed['bboxes'] else torch.zeros((0, 4), dtype=torch.float32)
         labels_tensor = torch.tensor(transformed['labels'], dtype=torch.int64) if transformed['labels'] else torch.zeros(0, dtype=torch.int64)
     except Exception as e:
-        # Simplified error handling
+        # Error handling
         image = transform_fn(image=img)['image']
         boxes_tensor = torch.tensor([[0, 0, 1, 1]], dtype=torch.float32)
         labels_tensor = torch.tensor([0], dtype=torch.int64)
@@ -107,14 +110,13 @@ def custom_collate_fn(batch):
 # Map the datasets
 mapped_train_dataset = train_dataset.map(
     train_mapper, 
-    remove_columns=["image", "label"],
-    num_proc=4  # Adjust based on your CPU cores
+    remove_columns=["image", "label"],  
+    num_proc=4  
 )
 
 mapped_val_dataset = val_dataset.map(
     val_mapper, 
-    remove_columns=["image", "label"],
-    num_proc=4
+    remove_columns=["image", "label"],  
 )
 
 # Create DataLoaders
@@ -199,88 +201,133 @@ class SSD(nn.Module):
         self.scales = [0.1, 0.2, 0.37, 0.54, 0.71, 0.88, 1.05]  # anchor box scales
         self.aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]  # aspect ratios for each feature map
         
+        # Calculate number of boxes per feature map cell
+        self.num_anchors = []
+        for ar in self.aspect_ratios:
+            # 1 + extra scale for aspect ratio 1 + 2 for each additional aspect ratio
+            self.num_anchors.append(2 + 2 * len(ar))
+        
+        # Define location layers (with correct output channels)
+        self.loc_layers = nn.ModuleList([
+            nn.Conv2d(512, self.num_anchors[0] * 4, kernel_size=3, padding=1),  # For conv1
+            nn.Conv2d(512, self.num_anchors[1] * 4, kernel_size=3, padding=1),  # For conv2
+            nn.Conv2d(256, self.num_anchors[2] * 4, kernel_size=3, padding=1),  # For conv3
+            nn.Conv2d(256, self.num_anchors[3] * 4, kernel_size=3, padding=1),  # For conv4
+            nn.Conv2d(256, self.num_anchors[4] * 4, kernel_size=3, padding=1),  # For conv5
+            nn.Conv2d(256, self.num_anchors[5] * 4, kernel_size=3, padding=1)   # For conv6
+        ])
+
+        # Define confidence layers (with correct output channels)
+        self.conf_layers = nn.ModuleList([
+            nn.Conv2d(512, self.num_anchors[0] * num_classes, kernel_size=3, padding=1),  # For conv1
+            nn.Conv2d(512, self.num_anchors[1] * num_classes, kernel_size=3, padding=1),  # For conv2
+            nn.Conv2d(256, self.num_anchors[2] * num_classes, kernel_size=3, padding=1),  # For conv3
+            nn.Conv2d(256, self.num_anchors[3] * num_classes, kernel_size=3, padding=1),  # For conv4
+            nn.Conv2d(256, self.num_anchors[4] * num_classes, kernel_size=3, padding=1),  # For conv5
+            nn.Conv2d(256, self.num_anchors[5] * num_classes, kernel_size=3, padding=1)   # For conv6
+        ])
+        
         # Generate default boxes
-        self.default_boxes = []
-        for k, f in enumerate(self.feature_maps): # k=feature map index f=the size of the feature map
+        self._create_default_boxes()
+        
+    def _create_default_boxes(self):
+        """Generate default (anchor) boxes for all feature map cells"""
+        default_boxes = []
+        
+        # For each feature map
+        for k, f in enumerate(self.feature_maps):
+            # For each cell in the feature map
             for i in range(f):
                 for j in range(f):
-                    cx = (j + 0.5) / f # x coordinates
-                    cy = (i + 0.5) / f # y coordinates
+                    # Center of the cell (normalized coordinates)
+                    cx = (j + 0.5) / f
+                    cy = (i + 0.5) / f
                     
                     # Aspect ratio: 1
                     s = self.scales[k]
-                    self.default_boxes.append([cx, cy, s, s])
+                    default_boxes.append([cx, cy, s, s])
                     
                     # Additional scale for aspect ratio 1
-                    s_prime = np.sqrt(s * self.scales[k + 1]) if k < len(self.feature_maps) - 1 else 1
-                    self.default_boxes.append([cx, cy, s_prime, s_prime])
+                    if k < len(self.feature_maps) - 1:
+                        s_prime = np.sqrt(s * self.scales[k + 1])
+                        default_boxes.append([cx, cy, s_prime, s_prime])
+                    else:
+                        s_prime = 1.0
+                        default_boxes.append([cx, cy, s_prime, s_prime])
                     
                     # Other aspect ratios
                     for ar in self.aspect_ratios[k]:
-                        self.default_boxes.extend([
-                            [cx, cy, s * np.sqrt(ar), s / np.sqrt(ar)],
-                            [cx, cy, s / np.sqrt(ar), s * np.sqrt(ar)]
-                        ])
+                        default_boxes.append([cx, cy, s * np.sqrt(ar), s / np.sqrt(ar)])
+                        default_boxes.append([cx, cy, s / np.sqrt(ar), s * np.sqrt(ar)])
         
-        self.default_boxes = torch.FloatTensor(self.default_boxes)
+        self.default_boxes = torch.FloatTensor(default_boxes)
+        
+        # Convert default boxes from (cx, cy, w, h) to (xmin, ymin, xmax, ymax)
+        self.default_boxes_xyxy = self._center_to_corner(self.default_boxes)
         self.default_boxes.clamp_(0, 1)
+        self.default_boxes_xyxy.clamp_(0, 1)
 
-        # Define location layers
-        self.loc_layers = nn.ModuleList([
-            nn.Conv2d(512, 4 * 4, kernel_size=3, padding=1),  # For conv1
-            nn.Conv2d(512, 6 * 4, kernel_size=3, padding=1),  # For conv2
-            nn.Conv2d(256, 6 * 4, kernel_size=3, padding=1),  # For conv3
-            nn.Conv2d(256, 6 * 4, kernel_size=3, padding=1),  # For conv4
-            nn.Conv2d(256, 4 * 4, kernel_size=3, padding=1),  # For conv5
-            nn.Conv2d(256, 4 * 4, kernel_size=3, padding=1)   # For conv6
-        ])
-
-        # Define confidence layers
-        self.conf_layers = nn.ModuleList([
-            nn.Conv2d(512, 4 * num_classes, kernel_size=3, padding=1),  # For conv1
-            nn.Conv2d(512, 6 * num_classes, kernel_size=3, padding=1),  # For conv2
-            nn.Conv2d(256, 6 * num_classes, kernel_size=3, padding=1),  # For conv3
-            nn.Conv2d(256, 6 * num_classes, kernel_size=3, padding=1),  # For conv4
-            nn.Conv2d(256, 4 * num_classes, kernel_size=3, padding=1),  # For conv5
-            nn.Conv2d(256, 4 * num_classes, kernel_size=3, padding=1)   # For conv6
-        ])
+    def _center_to_corner(self, boxes):
+        """Convert boxes from (cx, cy, w, h) to (xmin, ymin, xmax, ymax)"""
+        corner_boxes = boxes.clone()
+        corner_boxes[:, 0] = boxes[:, 0] - boxes[:, 2] / 2  # xmin = cx - w/2
+        corner_boxes[:, 1] = boxes[:, 1] - boxes[:, 3] / 2  # ymin = cy - h/2
+        corner_boxes[:, 2] = boxes[:, 0] + boxes[:, 2] / 2  # xmax = cx + w/2
+        corner_boxes[:, 3] = boxes[:, 1] + boxes[:, 3] / 2  # ymax = cy + h/2
+        return corner_boxes
 
     # Forward function
     def forward(self, x):
         # Extract feature maps
-        feature_maps = []
+        sources = []
+        
+        # Apply VGG layers and extract feature maps
         x = self.conv1(x)
-        feature_maps.append(x)
+        sources.append(x)  # 38x38 feature map
+        
         x = self.conv2(x)
-        feature_maps.append(x)
+        sources.append(x)  # 19x19 feature map
+        
         x = self.conv3(x)
-        feature_maps.append(x)
+        sources.append(x)  # 10x10 feature map
+        
         x = self.conv4(x)
-        feature_maps.append(x)
+        sources.append(x)  # 5x5 feature map
+        
         x = self.conv5(x)
-        feature_maps.append(x)
+        sources.append(x)  # 3x3 feature map
+        
         x = self.conv6(x)
-        feature_maps.append(x)
+        sources.append(x)  # 1x1 feature map
 
         # Apply prediction layers
         loc_preds = []
         conf_preds = []
-        for i, feature_map in enumerate(feature_maps):
-            # Predicts bounding box ajustments
-            loc_pred = self.loc_layers[i](feature_map)
-            # Predicts class probabilites
-            conf_pred = self.conf_layers[i](feature_map)
-            loc_preds.append(loc_pred.permute(0, 2, 3, 1).contiguous())
-            conf_preds.append(conf_pred.permute(0, 2, 3, 1).contiguous())
+        
+        for i, (source, loc_layer, conf_layer) in enumerate(zip(sources, self.loc_layers, self.conf_layers)):
+            # Get location predictions
+            loc = loc_layer(source)
+            batch_size = loc.size(0)
+            # Reshape to [batch_size, height, width, num_anchors * 4] then flatten to [batch_size, num_anchors_total, 4]
+            loc = loc.permute(0, 2, 3, 1).contiguous()
+            loc = loc.view(batch_size, -1, 4)
+            loc_preds.append(loc)
+            
+            # Get confidence predictions
+            conf = conf_layer(source)
+            # Reshape to [batch_size, height, width, num_anchors * num_classes] then flatten
+            conf = conf.permute(0, 2, 3, 1).contiguous()
+            conf = conf.view(batch_size, -1, self.num_classes)
+            conf_preds.append(conf)
 
-        # Reshape and concatenate predictions
-        loc_preds = torch.cat([o.view(o.size(0), -1) for o in loc_preds], 1)
-        conf_preds = torch.cat([o.view(o.size(0), -1) for o in conf_preds], 1)
-
-        return loc_preds, conf_preds, self.default_boxes
+        # Concatenate predictions from different feature maps
+        loc_preds = torch.cat(loc_preds, dim=1)
+        conf_preds = torch.cat(conf_preds, dim=1)
+        
+        return loc_preds, conf_preds, self.default_boxes_xyxy
 
 # Instantiate the SSD model and send it to the GPU
-num_classes = 21
+num_classes = 21  # 20 object classes + 1 background class
 model = SSD(num_classes=num_classes)
 model.to(device)
 
@@ -289,8 +336,8 @@ def box_iou(boxes1, boxes2):
     Compute Intersection over Union (IoU) between two sets of boxes.
     
     Args:
-        boxes1 (torch.Tensor): Shape (N, 4)
-        boxes2 (torch.Tensor): Shape (M, 4)
+        boxes1 (torch.Tensor): Shape (N, 4) in format (xmin, ymin, xmax, ymax)
+        boxes2 (torch.Tensor): Shape (M, 4) in format (xmin, ymin, xmax, ymax)
     
     Returns:
         torch.Tensor: IoU matrix of shape (N, M)
@@ -309,28 +356,37 @@ def box_iou(boxes1, boxes2):
 
 def encode_boxes(matched_boxes, default_boxes):
     """
-    Encode ground truth boxes relative to default boxes.
+    Encode ground truth boxes relative to default boxes (anchor boxes).
     
     Args:
-        matched_boxes (torch.Tensor): Ground truth boxes (N, 4)
-        default_boxes (torch.Tensor): Default anchor boxes (N, 4)
+        matched_boxes (torch.Tensor): Ground truth boxes (N, 4) in corner format
+        default_boxes (torch.Tensor): Default anchor boxes (N, 4) in corner format
     
     Returns:
-        torch.Tensor: Encoded box locations
+        torch.Tensor: Encoded box locations (as used in the SSD paper)
     """
-    def box_to_centerwidth(boxes):
+    # Convert from corner to center format
+    def corner_to_center(boxes):
         width = boxes[:, 2] - boxes[:, 0]
         height = boxes[:, 3] - boxes[:, 1]
-        ctr_x = boxes[:, 0] + width / 2
-        ctr_y = boxes[:, 1] + height / 2
-        return torch.stack([ctr_x, ctr_y, width, height], dim=1)
+        cx = boxes[:, 0] + width / 2
+        cy = boxes[:, 1] + height / 2
+        return torch.stack([cx, cy, width, height], dim=1)
     
-    g_cxcy = box_to_centerwidth(matched_boxes)
-    d_cxcy = box_to_centerwidth(default_boxes)
+    # Get centers, widths and heights
+    g_boxes = corner_to_center(matched_boxes)
+    d_boxes = corner_to_center(default_boxes)
     
-    encoded_boxes = torch.zeros_like(g_cxcy)
-    encoded_boxes[:, :2] = (g_cxcy[:, :2] - d_cxcy[:, :2]) / (d_cxcy[:, 2:] + 1e-8)
-    encoded_boxes[:, 2:] = torch.log(g_cxcy[:, 2:] / (d_cxcy[:, 2:] + 1e-8))
+    # Encode according to SSD paper
+    encoded_boxes = torch.zeros_like(g_boxes)
+    # (gx - dx) / dw -> cx
+    encoded_boxes[:, 0] = (g_boxes[:, 0] - d_boxes[:, 0]) / (d_boxes[:, 2] + 1e-8)
+    # (gy - dy) / dh -> cy
+    encoded_boxes[:, 1] = (g_boxes[:, 1] - d_boxes[:, 1]) / (d_boxes[:, 3] + 1e-8)
+    # log(gw / dw) -> width
+    encoded_boxes[:, 2] = torch.log(g_boxes[:, 2] / (d_boxes[:, 2] + 1e-8) + 1e-8)
+    # log(gh / dh) -> height
+    encoded_boxes[:, 3] = torch.log(g_boxes[:, 3] / (d_boxes[:, 3] + 1e-8) + 1e-8)
     
     return encoded_boxes
 
@@ -341,7 +397,7 @@ class SSD_loss(nn.Module):
 
         Args:
             num_classes (int): Number of object classes
-            default_boxes (torch.Tensor): Default anchor boxes
+            default_boxes (torch.Tensor): Default anchor boxes (in corner format)
             device (torch.device): GPU or CPU
         """
         super(SSD_loss, self).__init__()
@@ -350,10 +406,10 @@ class SSD_loss(nn.Module):
         self.default_boxes = default_boxes.to(device)
         self.device = device
         
-        self.threshold = 0.5
-        self.neg_pos_ratio = 3
+        self.threshold = 0.5  # IoU threshold for positive matches
+        self.neg_pos_ratio = 3  # Ratio of negative to positive samples
         
-        self.smooth_l1 = nn.SmoothL1Loss(reduction='none')
+        self.smooth_l1 = nn.SmoothL1Loss(reduction='sum')
         self.cross_entropy = nn.CrossEntropyLoss(reduction='none')
     
     def forward(self, predictions, targets):
@@ -362,70 +418,99 @@ class SSD_loss(nn.Module):
 
         Args:
             predictions (tuple): (loc_preds, conf_preds, default_boxes)
-                - loc_preds: Shape (batch_size, num_priors, 4) (Predicted box offsets)
-                - conf_preds: Shape (batch_size, num_priors, num_classes) (Class probabilities)
+                - loc_preds: Shape (batch_size, num_priors, 4)
+                - conf_preds: Shape (batch_size, num_priors, num_classes)
                 - default_boxes: Default boxes used in the model
             targets (dict): {"boxes": [list of GT boxes], "labels": [list of GT labels]}
         
         Returns:
             torch.Tensor: Total loss
         """
-        # Unpack predictions to match the updated model.forward() return values
         loc_preds, conf_preds, _ = predictions
         batch_size = loc_preds.size(0)
         num_priors = self.default_boxes.size(0)
         
+        # Create empty tensors for the targets
         loc_t = torch.zeros(batch_size, num_priors, 4).to(self.device)
         conf_t = torch.zeros(batch_size, num_priors, dtype=torch.long).to(self.device)
         
+        # For each image in the batch
         for idx in range(batch_size):
-            truths = targets['boxes'][idx]
-            labels = targets['labels'][idx]
+            truths = targets['boxes'][idx]  # Ground truth boxes
+            labels = targets['labels'][idx]  # Ground truth labels
             
-            if truths.size(0) == 0:
+            if truths.size(0) == 0:  # Skip if no ground truth boxes
                 continue
             
+            # Calculate IoU between default boxes and ground truth boxes
             overlaps = box_iou(self.default_boxes, truths)
-            best_truth_overlap, best_truth_idx = overlaps.max(1)  
             
-            best_prior_overlap, best_prior_idx = overlaps.max(0)  
+            # For each default box, find the best matching ground truth box
+            best_truth_overlap, best_truth_idx = overlaps.max(1)
+            
+            # For each ground truth box, find the best matching default box
+            best_prior_overlap, best_prior_idx = overlaps.max(0)
+            # Make sure each ground truth box has at least one matching default box
             for j in range(best_prior_idx.size(0)):
                 best_truth_idx[best_prior_idx[j]] = j
-                best_truth_overlap[best_prior_idx[j]] = 2  
-
-            matches = truths[best_truth_idx]  
-            conf = labels[best_truth_idx]  
-            conf[best_truth_overlap < self.threshold] = 0  
+                best_truth_overlap[best_prior_idx[j]] = 2.0  # Ensure it's greater than threshold
             
+            # Get matched ground truth boxes and labels
+            matches = truths[best_truth_idx]
+            match_labels = labels[best_truth_idx]
+            
+            # Set background label (0) for boxes with low overlap
+            match_labels[best_truth_overlap < self.threshold] = 0
+            
+            # Encode the ground truth boxes relative to default boxes
             loc_t[idx] = encode_boxes(matches, self.default_boxes)
-            conf_t[idx] = conf
+            conf_t[idx] = match_labels
         
+        # Compute positive mask (where gt label > 0)
         pos = conf_t > 0
-        loc_loss = self.smooth_l1(loc_preds[pos], loc_t[pos]).sum()
+        num_pos = pos.sum().item()
         
-        conf_loss = self.cross_entropy(conf_preds.view(-1, self.num_classes), conf_t.view(-1))
-        conf_loss = conf_loss.view(batch_size, -1)
-        conf_loss[pos] = 0  
-
-        _, loss_idx = conf_loss.sort(1, descending=True)
+        # Localization loss (only for positive matches)
+        pos_idx = pos.unsqueeze(2).expand_as(loc_preds)
+        loc_loss = self.smooth_l1(loc_preds[pos_idx].view(-1, 4), 
+                                 loc_t[pos_idx].view(-1, 4))
+        
+        # Confidence loss
+        # Reshape confidence predictions to [batch_size * num_priors, num_classes]
+        batch_conf = conf_preds.view(-1, self.num_classes)
+        # Compute softmax loss
+        loss_c = self.cross_entropy(batch_conf, conf_t.view(-1))
+        loss_c = loss_c.view(batch_size, -1)
+        
+        # Hard negative mining
+        # Exclude positive examples from negative mining
+        loss_c[pos] = 0
+        # Sort confidence losses in descending order
+        _, loss_idx = loss_c.sort(1, descending=True)
         _, idx_rank = loss_idx.sort(1)
-        num_pos = pos.long().sum(1)
-        num_neg = torch.clamp(self.neg_pos_ratio * num_pos, max=pos.size(1) - 1)
-        
+        # Number of negative examples to keep
+        num_pos_per_batch = pos.long().sum(1)
+        num_neg = torch.clamp(self.neg_pos_ratio * num_pos_per_batch, min=1, max=num_priors - 1)
+        # Keep only the selected negatives
         neg = idx_rank < num_neg.unsqueeze(1)
         
-        pos_conf_loss = conf_loss[pos].sum()
-        neg_conf_loss = conf_loss[neg].sum()
+        # Combine positive and selected negative examples for confidence loss
+        pos_idx = pos.unsqueeze(2).expand_as(conf_preds)
+        neg_idx = neg.unsqueeze(2).expand_as(conf_preds)
+        conf_loss = self.cross_entropy(conf_preds[pos_idx | neg_idx].view(-1, self.num_classes),
+                                    conf_t[pos | neg].view(-1))
         
-        epsilon = 1e-6
-        loss = (loc_loss + pos_conf_loss + neg_conf_loss) / (num_pos.sum().float() + epsilon)
+        # Normalize by number of positive examples
+        pos_count = max(1, num_pos)  # Avoid division by zero
+        loc_loss /= pos_count
+        conf_loss /= pos_count
         
-        return loss
+        return loc_loss + conf_loss
 
 # Initialize the SSD loss function
 SSDLoss = SSD_loss(
     num_classes=num_classes, 
-    default_boxes=model.default_boxes, 
+    default_boxes=model.default_boxes_xyxy,  # Use boxes in corner format
     device=device
 )
 
@@ -485,6 +570,7 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
         # Get train loss mean
         train_loss = np.mean(train_loss)
 
+        # Validation phase
         model.eval()
         val_loss = []
         with torch.no_grad():
@@ -517,17 +603,3 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
         print(f'Epoch {it+1}/{epochs}, Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Duration: {dt}')
 
     return train_losses, val_losses
-
-# Train the model
-train_losses, val_losses = batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs=70)
-
-# Plot training and validation losses
-plt.plot(train_losses, label='train loss')
-plt.plot(val_losses, label='test loss')
-plt.legend()
-plt.show()
-
-# Save the model
-model_save_path = "ssd-object-detection.pth"
-torch.save(model.state_dict(), model_save_path)
-print(f"Model saved to {model_save_path}")
