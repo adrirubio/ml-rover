@@ -48,31 +48,31 @@ val_transforms = A.Compose([
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
 def convert_to_ssd_format(example, transform_fn):
-    # Convert the image to a numpy array
+    # Convert image to numpy array
     img = np.array(example["image"])
     
-    # Extract the label - for classification dataset, this is likely a single class label
+    # Extract label
     label = example.get("label", 0)
     
-    # For a classification dataset converted to detection format:
-    # Use the whole image as a bounding box and the label as the class
+    # Create bounding box for the whole image
     height, width = img.shape[:2]
-    boxes = [[0, 0, width, height]]  # Default box covering the whole image
+    boxes = [[0, 0, width, height]]  # Default box covering whole image
     labels = [label]
     
-    # Apply transforms to image and bounding boxes
-    try:
-        transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
-        
-        # Extract results 
-        image = transformed['image']
-        boxes_tensor = torch.tensor(transformed['bboxes'], dtype=torch.float32) if transformed['bboxes'] else torch.zeros((0, 4), dtype=torch.float32)
-        labels_tensor = torch.tensor(transformed['labels'], dtype=torch.int64) if transformed['labels'] else torch.zeros(0, dtype=torch.int64)
-    except Exception as e:
-        # Error handling
-        image = transform_fn(image=img)['image']
-        boxes_tensor = torch.tensor([[0, 0, 1, 1]], dtype=torch.float32)
-        labels_tensor = torch.tensor([0], dtype=torch.int64)
+    # Apply transform
+    transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
+    
+    # Extract and convert results to tensors
+    image = transformed['image']  # Already a tensor from ToTensorV2
+    
+    # Fast tensor conversion with proper handling of empty results
+    if transformed['bboxes']:
+        boxes_tensor = torch.tensor(transformed['bboxes'], dtype=torch.float32)
+        labels_tensor = torch.tensor(transformed['labels'], dtype=torch.int64)
+    else:
+        # Fallback for cases where transforms removed all boxes
+        boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+        labels_tensor = torch.zeros(0, dtype=torch.int64)
     
     return {
         "image": image,
@@ -109,14 +109,17 @@ def custom_collate_fn(batch):
 
 # Map the datasets
 mapped_train_dataset = train_dataset.map(
-    train_mapper, 
-    remove_columns=["image", "label"],  
-    num_proc=4  
+    train_mapper,  
+    with_indices=False,
+    remove_columns=["image", "label"],
+    num_proc=8
 )
 
 mapped_val_dataset = val_dataset.map(
-    val_mapper, 
-    remove_columns=["image", "label"],  
+    val_mapper,
+    with_indices=False,
+    remove_columns=["image", "label"],
+    num_proc=8
 )
 
 # Create DataLoaders
