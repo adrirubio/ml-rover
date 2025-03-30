@@ -15,10 +15,11 @@ from datetime import datetime
 
 # Load the Pascal VOC dataset
 voc_dataset = load_dataset("EduardoLawson1/Pascal_voc")
-
-# Access train and validation splits 
-train_dataset = voc_dataset["train"]
-val_dataset = voc_dataset["val"]
+ 
+# Split the train split into 90% train and 10% validation
+split_dataset = voc_dataset["train"].train_test_split(test_size=0.1, seed=42)
+train_dataset = split_dataset["train"]
+val_dataset = split_dataset["test"]
 
 # Define transforms for training data using Albumentations
 train_transforms = A.Compose([
@@ -44,12 +45,21 @@ def convert_to_ssd_format(example, transform_fn):
     # Convert the image to a numpy array
     img = np.array(example["image"])
     
-    # Convert the mask to a numpy array
-    mask = np.array(example["mask"])
-    # Extract bounding boxes and labels from the mask
-    boxes, labels = mask_to_boxes_and_labels(mask)
+    # Extract bounding boxes and labels from the 'label' column
+    boxes = []
+    labels = []
+    # Assuming each object annotation is a dictionary with keys "bbox" and "label"
+    for obj in example["label"]:
+        bbox = obj["bbox"]
+        label = obj["label"]
+        # Convert Pascal VOC bbox format [x_min, y_min, width, height] to [x_min, y_min, x_max, y_max]
+        x_min, y_min, width, height = bbox
+        x_max = x_min + width
+        y_max = y_min + height
+        boxes.append([x_min, y_min, x_max, y_max])
+        labels.append(label)
     
-    # Apply Albumentations transforms to the image and bounding boxes
+    # Apply Albumentations transforms to image and bounding boxes
     transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
     
     # Retrieve the transformed image and boxes
@@ -58,7 +68,7 @@ def convert_to_ssd_format(example, transform_fn):
     transformed_labels = transformed['labels']
     
     # Convert to tensors
-    if transformed_boxes:
+    if transformed_boxes:  # Ensure there's at least one box
         boxes_tensor = torch.tensor(transformed_boxes, dtype=torch.float32)
         labels_tensor = torch.tensor(transformed_labels, dtype=torch.int64)
     else:
