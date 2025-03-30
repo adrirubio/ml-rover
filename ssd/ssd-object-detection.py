@@ -13,14 +13,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime
 
-# Load PASCAL VOC 2007 - both train and validation sets
-voc_dataset = load_dataset("voc", "2007")
+# Load the Pascal VOC dataset
+voc_dataset = load_dataset("merve/pascal-voc")
 
-# Access train and validation splits
+# Access train and validation splits 
 train_dataset = voc_dataset["train"]
 val_dataset = voc_dataset["validation"]
 
-# Define transforms for training data
+# Define transforms for training data using Albumentations
 train_transforms = A.Compose([
     A.RandomSizedBBoxSafeCrop(height=300, width=300, p=0.5),
     A.HorizontalFlip(p=0.5),
@@ -30,63 +30,61 @@ train_transforms = A.Compose([
     A.Resize(height=300, width=300),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
-], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category']))
+], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
 # Validation transforms with Albumentations
 val_transforms = A.Compose([
     A.Resize(height=300, width=300),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
-], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['category']))
+], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
-# Function to convert Hugging Face dataset to PyTorch format
+# Function to convert a Pascal VOC example to SSD format
 def convert_to_ssd_format(example, transform_fn):
-    # Get original image
-    img = np.array(example["image"])  # Albumentations expects numpy arrays
+    # Convert the image to a numpy array (Albumentations expects numpy arrays)
+    img = np.array(example["image"])
     
-    # Get bounding boxes and class labels
+    # Extract bounding boxes and labels from the dataset
     boxes = []
-    categories = []
-    
-    for bbox, category in zip(example["objects"]["bbox"], example["objects"]["category"]):
+    labels = []
+    for bbox, label in zip(example["objects"]["bbox"], example["objects"]["label"]):
+        # Pascal VOC boxes are provided as [x_min, y_min, width, height]
         x_min, y_min, width, height = bbox
         x_max = x_min + width
         y_max = y_min + height
         boxes.append([x_min, y_min, x_max, y_max])
-        categories.append(category)
-
+        labels.append(label)
     
-    # Apply transforms to image and bounding boxes
-    transformed = transform_fn(image=img, bboxes=boxes, category=categories)
+    # Apply Albumentations transforms to the image and bounding boxes
+    transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
     
-    # Extract transformed data
-    image = transformed['image']  # Already a tensor from ToTensor
+    # Retrieve the transformed image and boxes
+    image = transformed['image']  # Already a tensor due to ToTensorV2
     transformed_boxes = transformed['bboxes']
-    transformed_categories = transformed['category']
+    transformed_labels = transformed['labels']
     
-    # Convert to tensors (boxes already normalized by Albumentations)
-    if transformed_boxes:  # Check if any boxes remain after transform
-        boxes = torch.tensor(transformed_boxes, dtype=torch.float32)
-        labels = torch.tensor(transformed_categories, dtype=torch.int64)
+    # Convert the transformed bounding boxes and labels to tensors
+    if transformed_boxes:  # Ensure there is at least one bounding box
+        boxes_tensor = torch.tensor(transformed_boxes, dtype=torch.float32)
+        labels_tensor = torch.tensor(transformed_labels, dtype=torch.int64)
     else:
-        # Handle case where all boxes were removed by transform
-        boxes = torch.zeros((0, 4), dtype=torch.float32)
-        labels = torch.zeros(0, dtype=torch.int64)
+        boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
+        labels_tensor = torch.zeros(0, dtype=torch.int64)
     
     return {
         "image": image,
-        "boxes": boxes,
-        "labels": labels
+        "boxes": boxes_tensor,
+        "labels": labels_tensor
     }
 
-# Create dataset mappers
+# Create mapping functions for training and validation datasets
 def train_mapper(example):
     return convert_to_ssd_format(example, train_transforms)
 
 def val_mapper(example):
     return convert_to_ssd_format(example, val_transforms)
 
-# Define custom collate function to handle variable-sized boxes and labels
+# Define a custom collate function to handle batches with varying numbers of objects
 def custom_collate_fn(batch):
     images = []
     boxes = []
@@ -102,11 +100,11 @@ def custom_collate_fn(batch):
     
     return {
         "images": images,
-        "boxes": boxes,  # List of tensors with different shapes
-        "labels": labels  # List of tensors with different shapes
+        "boxes": boxes,  # List of tensors with different shapes per image
+        "labels": labels  # List of tensors with different shapes per image
     }
 
-# Map the datasets
+# Map the datasets to apply the transformation functions (removing the original columns)
 mapped_train_dataset = train_dataset.map(train_mapper, remove_columns=["image", "objects"])
 mapped_val_dataset = val_dataset.map(val_mapper, remove_columns=["image", "objects"])
 
@@ -508,20 +506,20 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
         val_losses[it] = val_loss
 
         dt = datetime.now() - t0
-        print(f'Epoch {it+1}/{epochs}, Train Loss: {train_loss:.4f}, \
-            Validation Loss: {val_loss:.4f}, Duration: {dt}')
+        print(f'Epoch {it+1}/{epochs}, Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Duration: {dt}')
 
     return train_losses, val_losses
 
+# Train the model
 train_losses, val_losses = batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs=70)
 
-# Loss train and test loss
+# Plot training and validation losses
 plt.plot(train_losses, label='train loss')
 plt.plot(val_losses, label='test loss')
 plt.legend()
 plt.show()
 
-# Save model
+# Save the model
 model_save_path = "ssd-object-detection.pth"
 torch.save(model.state_dict(), model_save_path)
 print(f"Model saved to {model_save_path}")
