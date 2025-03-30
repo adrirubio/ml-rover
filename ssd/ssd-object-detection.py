@@ -603,3 +603,17 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
         print(f'Epoch {it+1}/{epochs}, Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Duration: {dt}')
 
     return train_losses, val_losses
+
+# Train the model
+train_losses, val_losses = batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs=70)
+
+# Plot training and validation losses
+plt.plot(train_losses, label='train loss')
+plt.plot(val_losses, label='test loss')
+plt.legend()
+plt.show()
+
+# Save the model
+model_save_path = "ssd-object-detection.pth"
+torch.save(model.state_dict(), model_save_path)
+print(f"Model saved to {model_save_path}")
