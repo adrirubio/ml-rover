@@ -110,14 +110,12 @@ def custom_collate_fn(batch):
 # Map the datasets
 mapped_train_dataset = train_dataset.map(
     train_mapper,  
-    with_indices=False,
     remove_columns=["image", "label"],
     num_proc=8
 )
 
 mapped_val_dataset = val_dataset.map(
     val_mapper,
-    with_indices=False,
     remove_columns=["image", "label"],
     num_proc=8
 )
@@ -210,7 +208,7 @@ class SSD(nn.Module):
             # 1 + extra scale for aspect ratio 1 + 2 for each additional aspect ratio
             self.num_anchors.append(2 + 2 * len(ar))
         
-        # Define location layers (with correct output channels)
+        # Define location layers
         self.loc_layers = nn.ModuleList([
             nn.Conv2d(512, self.num_anchors[0] * 4, kernel_size=3, padding=1),  # For conv1
             nn.Conv2d(512, self.num_anchors[1] * 4, kernel_size=3, padding=1),  # For conv2
@@ -220,7 +218,7 @@ class SSD(nn.Module):
             nn.Conv2d(256, self.num_anchors[5] * 4, kernel_size=3, padding=1)   # For conv6
         ])
 
-        # Define confidence layers (with correct output channels)
+        # Define confidence layers
         self.conf_layers = nn.ModuleList([
             nn.Conv2d(512, self.num_anchors[0] * num_classes, kernel_size=3, padding=1),  # For conv1
             nn.Conv2d(512, self.num_anchors[1] * num_classes, kernel_size=3, padding=1),  # For conv2
