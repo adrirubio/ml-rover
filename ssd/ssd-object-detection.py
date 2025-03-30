@@ -51,40 +51,25 @@ def convert_to_ssd_format(example, transform_fn):
     # Convert the image to a numpy array
     img = np.array(example["image"])
     
-    boxes = []
-    labels = []
-    
-    # Using label as a single object class for simplicity
-    # In real implementation, extract multiple objects from the dataset
+    # Extract all necessary information
     label = example.get("label", 0)
-    
-    # If no objects, create a dummy box covering the whole image
-    if not boxes:
-        height, width = img.shape[:2]
-        boxes = [[0, 0, width, height]]  # [x_min, y_min, x_max, y_max]
-        labels = [label]
+    height, width = img.shape[:2]
+    boxes = [[0, 0, width, height]]  # Default box
+    labels = [label]
     
     # Apply transforms to image and bounding boxes
     try:
         transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
         
-        image = transformed['image']  # Already a tensor due to ToTensorV2
-        transformed_boxes = transformed['bboxes']
-        transformed_labels = transformed['labels']
-        
-        # Convert to tensors
-        if transformed_boxes:
-            boxes_tensor = torch.tensor(transformed_boxes, dtype=torch.float32)
-            labels_tensor = torch.tensor(transformed_labels, dtype=torch.int64)
-        else:
-            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
-            labels_tensor = torch.zeros(0, dtype=torch.int64)
+        # Extract results 
+        image = transformed['image']
+        boxes_tensor = torch.tensor(transformed['bboxes'], dtype=torch.float32) if transformed['bboxes'] else torch.zeros((0, 4), dtype=torch.float32)
+        labels_tensor = torch.tensor(transformed['labels'], dtype=torch.int64) if transformed['labels'] else torch.zeros(0, dtype=torch.int64)
     except Exception as e:
-        # Handle edge cases where transformation might fail
-        height, width = img.shape[:2]
+        # Simplified error handling
         image = transform_fn(image=img)['image']
-        boxes_tensor = torch.tensor([[0, 0, 1, 1]], dtype=torch.float32)  # Normalized coordinates
-        labels_tensor = torch.tensor([0], dtype=torch.int64)  # Background class
+        boxes_tensor = torch.tensor([[0, 0, 1, 1]], dtype=torch.float32)
+        labels_tensor = torch.tensor([0], dtype=torch.int64)
     
     return {
         "image": image,
@@ -120,8 +105,17 @@ def custom_collate_fn(batch):
     }
 
 # Map the datasets
-mapped_train_dataset = train_dataset.map(train_mapper, remove_columns=["image", "label"])
-mapped_val_dataset = val_dataset.map(val_mapper, remove_columns=["image", "label"])
+mapped_train_dataset = train_dataset.map(
+    train_mapper, 
+    remove_columns=["image", "label"],
+    num_proc=4  # Adjust based on your CPU cores
+)
+
+mapped_val_dataset = val_dataset.map(
+    val_mapper, 
+    remove_columns=["image", "label"],
+    num_proc=4
+)
 
 # Create DataLoaders
 train_loader = DataLoader(
