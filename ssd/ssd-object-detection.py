@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 
 # Load PASCAL VOC 2007 - both train and validation sets
-voc_dataset = load_dataset("detection-datasets/pascal-voc", "detection-datasets--pascal-voc")
+voc_dataset = load_dataset("voc", "2007")
 
 # Access train and validation splits
 train_dataset = voc_dataset["train"]
