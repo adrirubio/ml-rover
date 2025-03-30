@@ -34,7 +34,7 @@ VOC_CLASSES = [
 
 # Define transforms with proper Albumentations pipeline
 train_transforms = A.Compose([
-    A.RandomResizedCrop(height=300, width=300, scale=(0.5, 1.0), p=1.0),
+    A.RandomResizedCrop(size=(300, 300), scale=(0.5, 1.0), p=1.0),
     A.HorizontalFlip(p=0.5),
     A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.5),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -42,11 +42,10 @@ train_transforms = A.Compose([
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels'], min_visibility=0.3))
 
 val_transforms = A.Compose([
-    A.Resize(height=300, width=300),
+    A.Resize(height=300, width=300),  # Keep using height and width here
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
-
 
 def convert_to_ssd_format(example, transform_fn):
     # Convert the image to a numpy array
@@ -290,6 +289,56 @@ class SSD(nn.Module):
 num_classes = 21
 model = SSD(num_classes=num_classes)
 model.to(device)
+
+def box_iou(boxes1, boxes2):
+    """
+    Compute Intersection over Union (IoU) between two sets of boxes.
+    
+    Args:
+        boxes1 (torch.Tensor): Shape (N, 4)
+        boxes2 (torch.Tensor): Shape (M, 4)
+    
+    Returns:
+        torch.Tensor: IoU matrix of shape (N, M)
+    """
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+    
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+    
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    
+    union = area1[:, None] + area2 - inter
+    return inter / union
+
+def encode_boxes(matched_boxes, default_boxes):
+    """
+    Encode ground truth boxes relative to default boxes.
+    
+    Args:
+        matched_boxes (torch.Tensor): Ground truth boxes (N, 4)
+        default_boxes (torch.Tensor): Default anchor boxes (N, 4)
+    
+    Returns:
+        torch.Tensor: Encoded box locations
+    """
+    def box_to_centerwidth(boxes):
+        width = boxes[:, 2] - boxes[:, 0]
+        height = boxes[:, 3] - boxes[:, 1]
+        ctr_x = boxes[:, 0] + width / 2
+        ctr_y = boxes[:, 1] + height / 2
+        return torch.stack([ctr_x, ctr_y, width, height], dim=1)
+    
+    g_cxcy = box_to_centerwidth(matched_boxes)
+    d_cxcy = box_to_centerwidth(default_boxes)
+    
+    encoded_boxes = torch.zeros_like(g_cxcy)
+    encoded_boxes[:, :2] = (g_cxcy[:, :2] - d_cxcy[:, :2]) / (d_cxcy[:, 2:] + 1e-8)
+    encoded_boxes[:, 2:] = torch.log(g_cxcy[:, 2:] / (d_cxcy[:, 2:] + 1e-8))
+    
+    return encoded_boxes
 
 class SSD_loss(nn.Module):
     def __init__(self, num_classes, default_boxes, device):
