@@ -1,6 +1,7 @@
 # SSD
+import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
@@ -9,65 +10,30 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import hsv_to_rgb
 import matplotlib.patches as patches
 from datetime import datetime
 import random
+import os
+from PIL import Image
+import json
 
 # Define device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# Load a subset of the COCO dataset
+# Load COCO dataset from Hugging Face
 print("Loading COCO dataset...")
-coco_dataset = load_dataset("detection-datasets/coco", trust_remote_code=True)
+coco_dataset = load_dataset("detection-datasets/coco", "2017", split="train[:15000]")  
+coco_val_dataset = load_dataset("detection-datasets/coco", "2017", split="validation[:3000]")
 
-# COCO has around 118K training images
-train_dataset_size = 10000
-val_dataset_size = 1000
-
-# Get a subset of the training data
-train_indices = random.sample(range(len(coco_dataset["train"])), train_dataset_size)
-train_dataset = coco_dataset["train"].select(train_indices)
-
-# Get a subset of the validation data
-val_indices = random.sample(range(len(coco_dataset["validation"])), val_dataset_size)
-val_dataset = coco_dataset["validation"].select(val_indices)
-
-print(f"Selected {len(train_dataset)} training images and {len(val_dataset)} validation images")
-
-# Print one sample to understand the dataset structure
-sample = train_dataset[0]
-print("Dataset sample keys:", sample.keys())
-if "objects" in sample:
-    print("First object in sample:", sample["objects"][0])
-elif "annotations" in sample:
-    print("First annotation in sample:", sample["annotations"][0])
-
-# We'll use a subset of classes to keep it manageable
-COCO_CLASSES = [
-    'background', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
-    'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
-    'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow'
-]
-num_classes = len(COCO_CLASSES)
-
-# Create mapping from COCO category ID to our class index
-coco_id_to_class_idx = {0: 0}  # Background class has index 0
-for i, class_name in enumerate(COCO_CLASSES[1:], 1):  
-    # Find the COCO category ID for this class name
-    if "categories" in coco_dataset["train"].features:
-        category_info = next((cat for cat in coco_dataset["train"].features["categories"] if cat["name"] == class_name), None)
-        if category_info:
-            coco_id_to_class_idx[category_info["id"]] = i
-    else:
-        coco_id_to_class_idx[i] = i
-
-print(f"Using {len(COCO_CLASSES)} classes: {COCO_CLASSES}")
+# Get COCO categories (for class mapping)
+coco_categories = {cat['id']: idx + 1 for idx, cat in enumerate(coco_dataset.features['objects'].feature['category'].feature['id'].names.values())}
+num_classes = len(coco_categories) + 1  # Add 1 for background class
+print(f"Number of classes: {num_classes}")
 
 # Define transforms with proper Albumentations pipeline
 train_transforms = A.Compose([
-    A.Resize(300, 300),  # Simple resize instead of RandomResizedCrop
+    A.Resize(300, 300),  # Simple resize 
     A.HorizontalFlip(p=0.5),
     A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.5),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -75,139 +41,154 @@ train_transforms = A.Compose([
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
 val_transforms = A.Compose([
-    A.Resize(width=300, height=300),  # For resize, width and height are separate parameters
+    A.Resize(width=300, height=300),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
-def convert_coco_to_ssd_format(example, transform_fn):
-    # Convert image to numpy array
-    img = np.array(example["image"])
-    height, width = img.shape[:2]
+# Define dataset mapper functions
+def train_mapper(example):
+    image = np.array(example['image'])
     
-    # Extract bounding boxes and labels from the dataset
+    # Extract bounding boxes and labels from COCO format
     boxes = []
     labels = []
     
-    # Check which format the dataset uses
-    if "objects" in example and example["objects"]:
-        # Some HF datasets use 'objects' field
-        for obj in example["objects"]:
-            # Check if the object class is in our subset
-            if "category_id" in obj and obj["category_id"] in coco_id_to_class_idx:
-                # Convert COCO bbox [x, y, width, height] to Pascal VOC [xmin, ymin, xmax, ymax]
-                if "bbox" in obj:
-                    x, y, w, h = obj["bbox"]
-                    # Ensure bbox is within image bounds
-                    x = max(0, min(x, width - 1))
-                    y = max(0, min(y, height - 1))
-                    w = max(1, min(w, width - x))
-                    h = max(1, min(h, height - y))
-                    
-                    xmin = x
-                    ymin = y
-                    xmax = x + w
-                    ymax = y + h
-                    
-                    # Add box and label
-                    boxes.append([xmin, ymin, xmax, ymax])
-                    labels.append(coco_id_to_class_idx[obj["category_id"]])
+    for obj in example['objects']:
+        # Convert COCO bbox [x, y, width, height] to Pascal VOC [xmin, ymin, xmax, ymax]
+        bbox = obj['bbox']
+        xmin = bbox[0]
+        ymin = bbox[1]
+        xmax = bbox[0] + bbox[2]
+        ymax = bbox[1] + bbox[3]
+        
+        # Skip invalid boxes
+        if xmax <= xmin or ymax <= ymin or xmax <= 0 or ymax <= 0:
+            continue
+            
+        # Get category ID and map to our class indices
+        coco_id = obj['category']
+        if coco_id in coco_categories:
+            class_idx = coco_categories[coco_id]
+            boxes.append([xmin, ymin, xmax, ymax])
+            labels.append(class_idx)
     
-    elif "annotations" in example and example["annotations"]:
-        # Official COCO uses 'annotations' field
-        for ann in example["annotations"]:
-            # Check if the object class is in our subset
-            if "category_id" in ann and ann["category_id"] in coco_id_to_class_idx:
-                # Convert COCO bbox [x, y, width, height] to Pascal VOC [xmin, ymin, xmax, ymax]
-                if "bbox" in ann:
-                    x, y, w, h = ann["bbox"]
-                    # Ensure bbox is within image bounds
-                    x = max(0, min(x, width - 1))
-                    y = max(0, min(y, height - 1))
-                    w = max(1, min(w, width - x))
-                    h = max(1, min(h, height - y))
-                    
-                    xmin = x
-                    ymin = y
-                    xmax = x + w
-                    ymax = y + h
-                    
-                    # Add box and label
-                    boxes.append([xmin, ymin, xmax, ymax])
-                    labels.append(coco_id_to_class_idx[ann["category_id"]])
-    
-    # If no valid boxes were found, create a default box
-    if not boxes:
-        boxes = [[0, 0, width, height]]  # Default box covering whole image
-        labels = [0]  # Background class
-    
-    # Apply transform
-    transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
-    
-    # Extract and convert results to tensors
-    image = transformed['image']  # Already a tensor from ToTensorV2
-    
-    # Fast tensor conversion with proper handling of empty results
-    if transformed['bboxes']:
-        boxes_tensor = torch.tensor(transformed['bboxes'], dtype=torch.float32)
-        labels_tensor = torch.tensor(transformed['labels'], dtype=torch.int64)
+    # Apply transformations
+    if boxes:
+        transformed = train_transforms(image=image, bboxes=boxes, labels=labels)
+        transformed_image = transformed['image']
+        transformed_boxes = transformed['bboxes']
+        transformed_labels = transformed['labels']
     else:
-        # Fallback for cases where transforms removed all boxes
-        boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
-        labels_tensor = torch.zeros(0, dtype=torch.int64)
+        # Handle case with no boxes
+        transformed_image = train_transforms(image=image, bboxes=[], labels=[])['image']
+        transformed_boxes = []
+        transformed_labels = []
+    
+    # Convert boxes to tensor
+    if transformed_boxes:
+        transformed_boxes = torch.tensor(transformed_boxes, dtype=torch.float32)
+    else:
+        transformed_boxes = torch.zeros((0, 4), dtype=torch.float32)
+    
+    if transformed_labels:
+        transformed_labels = torch.tensor(transformed_labels, dtype=torch.long)
+    else:
+        transformed_labels = torch.zeros(0, dtype=torch.long)
     
     return {
-        "image": image,
-        "boxes": boxes_tensor,
-        "labels": labels_tensor
+        'images': transformed_image,
+        'boxes': transformed_boxes,
+        'labels': transformed_labels
     }
 
-# Create mapping functions for training and validation datasets
-def train_mapper(example):
-    return convert_coco_to_ssd_format(example, train_transforms)
-
+# Validation mapper (similar to train_mapper but with val transforms)
 def val_mapper(example):
-    return convert_coco_to_ssd_format(example, val_transforms)
-
-# Define a collate function that handles variable-sized objects properly
-def custom_collate_fn(batch):
-    images = []
+    image = np.array(example['image'])
+    
+    # Extract bounding boxes and labels from COCO format
     boxes = []
     labels = []
     
-    for sample in batch:
-        images.append(sample["image"])
-        boxes.append(sample["boxes"])
-        labels.append(sample["labels"])
+    for obj in example['objects']:
+        # Convert COCO bbox [x, y, width, height] to Pascal VOC [xmin, ymin, xmax, ymax]
+        bbox = obj['bbox']
+        xmin = bbox[0]
+        ymin = bbox[1]
+        xmax = bbox[0] + bbox[2]
+        ymax = bbox[1] + bbox[3]
+        
+        # Skip invalid boxes
+        if xmax <= xmin or ymax <= ymin or xmax <= 0 or ymax <= 0:
+            continue
+            
+        # Get category ID and map to our class indices
+        coco_id = obj['category']
+        if coco_id in coco_categories:
+            class_idx = coco_categories[coco_id]
+            boxes.append([xmin, ymin, xmax, ymax])
+            labels.append(class_idx)
     
-    # Stack images into a single tensor - move to device later for efficiency
-    images = torch.stack(images, 0)
+    # Apply transformations
+    if boxes:
+        transformed = val_transforms(image=image, bboxes=boxes, labels=labels)
+        transformed_image = transformed['image']
+        transformed_boxes = transformed['bboxes']
+        transformed_labels = transformed['labels']
+    else:
+        # Handle case with no boxes
+        transformed_image = val_transforms(image=image, bboxes=[], labels=[])['image']
+        transformed_boxes = []
+        transformed_labels = []
+    
+    # Convert boxes to tensor
+    if transformed_boxes:
+        transformed_boxes = torch.tensor(transformed_boxes, dtype=torch.float32)
+    else:
+        transformed_boxes = torch.zeros((0, 4), dtype=torch.float32)
+    
+    if transformed_labels:
+        transformed_labels = torch.tensor(transformed_labels, dtype=torch.long)
+    else:
+        transformed_labels = torch.zeros(0, dtype=torch.long)
     
     return {
-        "images": images,
-        "boxes": boxes,  # List of tensors with different shapes per image
-        "labels": labels  # List of tensors with different shapes per image
+        'images': transformed_image,
+        'boxes': transformed_boxes,
+        'labels': transformed_labels
+    }
+
+# Define custom collate function to handle variable size boxes and labels
+def custom_collate_fn(batch):
+    images = torch.stack([item['images'] for item in batch])
+    boxes = [item['boxes'] for item in batch]
+    labels = [item['labels'] for item in batch]
+    
+    return {
+        'images': images,
+        'boxes': boxes,
+        'labels': labels
     }
 
 # Map the datasets
 print("Processing training dataset...")
-mapped_train_dataset = train_dataset.map(
+mapped_train_dataset = coco_dataset.map(
     train_mapper,  
-    remove_columns=train_dataset.column_names,
+    remove_columns=coco_dataset.column_names,
     num_proc=8
 )
 
 print("Processing validation dataset...")
-mapped_val_dataset = val_dataset.map(
+mapped_val_dataset = coco_val_dataset.map(
     val_mapper,
-    remove_columns=val_dataset.column_names,
+    remove_columns=coco_val_dataset.column_names,
     num_proc=8
 )
 
 # Create DataLoaders
 train_loader = DataLoader(
     mapped_train_dataset, 
-    batch_size=32, 
+    batch_size=16,  # Smaller batch size for H100 memory optimization
     shuffle=True, 
     num_workers=4,
     collate_fn=custom_collate_fn  
@@ -215,7 +196,7 @@ train_loader = DataLoader(
 
 val_loader = DataLoader(
     mapped_val_dataset, 
-    batch_size=32, 
+    batch_size=16, 
     shuffle=False, 
     num_workers=4,
     collate_fn=custom_collate_fn
@@ -223,7 +204,7 @@ val_loader = DataLoader(
 
 # Define model 
 class SSD(nn.Module):
-    def __init__(self, num_classes=21):
+    def __init__(self, num_classes):
         super(SSD, self).__init__()
         vgg = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
         features = list(vgg.features.children())
@@ -411,11 +392,6 @@ class SSD(nn.Module):
         
         return loc_preds, conf_preds, self.default_boxes_xyxy
 
-# Instantiate the SSD model and send it to the GPU
-num_classes = 21  # 20 object classes + 1 background class
-model = SSD(num_classes=num_classes)
-model.to(device)
-
 def box_iou(boxes1, boxes2):
     """
     Compute Intersection over Union (IoU) between two sets of boxes.
@@ -555,6 +531,10 @@ class SSD_loss(nn.Module):
         pos = conf_t > 0
         num_pos = pos.sum().item()
         
+        # Skip loss calculation if there are no positive examples
+        if num_pos == 0:
+            return torch.tensor(0.0).to(self.device)
+        
         # Localization loss (only for positive matches)
         pos_idx = pos.unsqueeze(2).expand_as(loc_preds)
         loc_loss = self.smooth_l1(loc_preds[pos_idx].view(-1, 4), 
@@ -592,6 +572,10 @@ class SSD_loss(nn.Module):
         
         return loc_loss + conf_loss
 
+# Instantiate the SSD model and send it to the GPU
+model = SSD(num_classes=num_classes)
+model.to(device)
+
 # Initialize the SSD loss function
 SSDLoss = SSD_loss(
     num_classes=num_classes, 
@@ -599,13 +583,13 @@ SSDLoss = SSD_loss(
     device=device
 )
 
-# Freeze first 10 layers of the VGG backbone
+# Freeze first 10 layers of the VGG backbone for faster training
 for idx, param in enumerate(model.conv1.parameters()):
     layer_idx = idx // 2  # Each layer has weights and biases, so divide by 2
     if layer_idx < 10:    # First 10 layers
         param.requires_grad = False
 
-# Define optimizer with lower learning rate in conv 1 and 2 (backbone)
+# Define optimizer with learning rate scheduling
 optimizer = optim.Adam([
     {'params': model.conv1.parameters(), 'lr': 0.0001, 'weight_decay': 1e-4},  # Lower learning rate
     {'params': model.conv2.parameters(), 'lr': 0.0001, 'weight_decay': 1e-4},  # Lower learning rate
@@ -617,17 +601,150 @@ optimizer = optim.Adam([
     {'params': model.conf_layers.parameters(), 'lr': 0.001, 'weight_decay': 1e-4}
 ], betas=(0.9, 0.999))
 
+# Learning rate scheduler to improve convergence
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, verbose=True)
+
+# Function to calculate mAP (simplified version for training feedback)
+def calculate_map(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.5):
+    model.eval()
+    all_detections = []
+    all_ground_truths = []
+    
+    with torch.no_grad():
+        for batch in val_loader:
+            images = batch['images'].to(device)
+            gt_boxes = batch['boxes']
+            gt_labels = batch['labels']
+            
+            # Forward pass
+            loc_preds, conf_preds, default_boxes = model(images)
+            
+            # Convert predictions to detections
+            batch_size = loc_preds.size(0)
+            for i in range(batch_size):
+                # Decode locations
+                detected_boxes = decode_boxes(loc_preds[i], default_boxes)
+                
+                # Get scores for each class
+                scores = torch.nn.functional.softmax(conf_preds[i], dim=1)
+                
+                # Keep track of detections and ground truths
+                detections = []
+                for c in range(1, num_classes):  # Skip background class
+                    class_scores = scores[:, c]
+                    mask = class_scores > conf_threshold
+                    
+                    if mask.sum() == 0:
+                        continue
+                        
+                    class_boxes = detected_boxes[mask]
+                    class_scores = class_scores[mask]
+                    
+                    # Non-maximum suppression
+                    indices = torchvision.ops.nms(class_boxes, class_scores, iou_threshold)
+                    
+                    for idx in indices:
+                        detections.append({
+                            'box': class_boxes[idx].cpu().numpy(),
+                            'score': class_scores[idx].item(),
+                            'class': c
+                        })
+                
+                all_detections.append(detections)
+                
+                # Ground truths
+                gt_boxes_img = gt_boxes[i].cpu().numpy()
+                gt_labels_img = gt_labels[i].cpu().numpy()
+                ground_truths = []
+                
+                for box, label in zip(gt_boxes_img, gt_labels_img):
+                    ground_truths.append({
+                        'box': box,
+                        'class': label.item()
+                    })
+                
+                all_ground_truths.append(ground_truths)
+    
+    # Simple mAP calculation
+    # This is a placeholder to give feedback during training
+    correct_detections = 0
+    total_detections = 1e-6  # Avoid division by zero
+    
+    for dets, gts in zip(all_detections, all_ground_truths):
+        total_detections += len(dets)
+        
+        for det in dets:
+            for gt in gts:
+                if det['class'] == gt['class']:
+                    # Calculate IoU
+                    iou = calculate_iou(det['box'], gt['box'])
+                    if iou >= iou_threshold:
+                        correct_detections += 1
+                        break
+    
+    return correct_detections / total_detections
+
+def decode_boxes(loc, default_boxes):
+    """Decode predicted box coordinates from offsets"""
+    # Convert default boxes from (xmin, ymin, xmax, ymax) to (cx, cy, w, h)
+    def corner_to_center(boxes):
+        width = boxes[:, 2] - boxes[:, 0]
+        height = boxes[:, 3] - boxes[:, 1]
+        cx = boxes[:, 0] + width / 2
+        cy = boxes[:, 1] + height / 2
+        return torch.stack([cx, cy, width, height], dim=1)
+    
+    # Convert default boxes to center format
+    default_boxes_center = corner_to_center(default_boxes)
+    
+    # Decode predictions
+    pred_cx = loc[:, 0] * default_boxes_center[:, 2] + default_boxes_center[:, 0]
+    pred_cy = loc[:, 1] * default_boxes_center[:, 3] + default_boxes_center[:, 1]
+    pred_w = torch.exp(loc[:, 2]) * default_boxes_center[:, 2]
+    pred_h = torch.exp(loc[:, 3]) * default_boxes_center[:, 3]
+    
+    # Convert back to corner format
+    boxes = torch.zeros_like(loc)
+    boxes[:, 0] = pred_cx - pred_w / 2
+    boxes[:, 1] = pred_cy - pred_h / 2
+    boxes[:, 2] = pred_cx + pred_w / 2
+    boxes[:, 3] = pred_cy + pred_h / 2
+    
+    return boxes
+
+def calculate_iou(box1, box2):
+    """Calculate IoU between two boxes"""
+    # Calculate intersection area
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    
+    # Calculate union area
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+    
+    return intersection / (union + 1e-10)
+
 # Training loop
-def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
+def train_model(model, SSDLoss, optimizer, scheduler, train_loader, val_loader, epochs):
     train_losses = np.zeros(epochs)
     val_losses = np.zeros(epochs)
+    
+    # For early stopping
+    best_val_loss = float('inf')
+    patience = 5
+    patience_counter = 0
     
     for it in range(epochs):
         model.train()
         t0 = datetime.now()
         train_loss = []
 
-        for batch in train_loader:
+        for batch_idx, batch in enumerate(train_loader):
             images = batch['images']
             boxes = batch['boxes']
             labels = batch['labels']
@@ -643,17 +760,30 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
             # Forward pass
             loc_preds, conf_preds, default_boxes = model(images)
             
+            # Skip batches with no ground truth boxes
+            if all(b.size(0) == 0 for b in boxes):
+                continue
+            
             # Compute loss
             loss = SSDLoss((loc_preds, conf_preds, default_boxes), {'boxes': boxes, 'labels': labels})
             
             # Backward pass and optimize
             loss.backward()
+            
+            # Gradient clipping to prevent explosion
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
+            
             optimizer.step()
 
             train_loss.append(loss.item())
+            
+            # Print progress
+            if (batch_idx + 1) % 20 == 0:
+                print(f"Epoch {it+1}/{epochs}, Batch {batch_idx+1}/{len(train_loader)}, Loss: {loss.item():.4f}")
         
         # Get train loss mean
-        train_loss = np.mean(train_loss)
+        train_loss_mean = np.mean(train_loss) if train_loss else 0
+        train_losses[it] = train_loss_mean
 
         # Validation phase
         model.eval()
@@ -669,6 +799,10 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
                 boxes = [b.to(device) for b in boxes]
                 labels = [l.to(device) for l in labels]
                 
+                # Skip batches with no ground truth boxes
+                if all(b.size(0) == 0 for b in boxes):
+                    continue
+                
                 # Forward pass
                 loc_preds, conf_preds, default_boxes = model(images)
                 
@@ -678,27 +812,67 @@ def batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs):
                 val_loss.append(loss.item())
         
         # Get validation loss mean
-        val_loss = np.mean(val_loss)
+        val_loss_mean = np.mean(val_loss) if val_loss else float('inf')
+        val_losses[it] = val_loss_mean
+        
+        # Update learning rate
+        scheduler.step(val_loss_mean)
 
-        # Save losses
-        train_losses[it] = train_loss
-        val_losses[it] = val_loss
-
+        # Calculate mAP on a subset of validation set (for performance reasons)
+        # mAP = calculate_map(model, val_loader, device)
+        
         dt = datetime.now() - t0
-        print(f'Epoch {it+1}/{epochs}, Train Loss: {train_loss:.4f}, Validation Loss: {val_loss:.4f}, Duration: {dt}')
+        print(f'Epoch {it+1}/{epochs}, Train Loss: {train_loss_mean:.4f}, Validation Loss: {val_loss_mean:.4f}, Duration: {dt}')
+        
+        # Early stopping check
+        if val_loss_mean < best_val_loss:
+            best_val_loss = val_loss_mean
+            patience_counter = 0
+            
+            # Save the best model
+            torch.save({
+                'epoch': it,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'loss': best_val_loss,
+            }, 'best_ssd_model.pth')
+            
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {it+1} epochs")
+                break
 
     return train_losses, val_losses
 
 # Train the model
-train_losses, val_losses = batch_gd(model, SSDLoss, optimizer, train_loader, val_loader, epochs=70)
+num_epochs = 35  # Reduced epochs to fit within 1-2 hours on H100
+train_losses, val_losses = train_model(model, SSDLoss, optimizer, scheduler, train_loader, val_loader, epochs=num_epochs)
 
 # Plot training and validation losses
-plt.plot(train_losses, label='train loss')
-plt.plot(val_losses, label='test loss')
+plt.figure(figsize=(10, 5))
+plt.plot(train_losses[:len(train_losses[train_losses > 0])], label='train loss')
+plt.plot(val_losses[:len(val_losses[val_losses > 0])], label='validation loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.title('Training and Validation Losses')
 plt.legend()
+plt.savefig('ssd_training_loss.png')
 plt.show()
 
-# Save the model
-model_save_path = "ssd-object-detection.pth"
-torch.save(model.state_dict(), model_save_path)
-print(f"Model saved to {model_save_path}")
+# Load the best model
+checkpoint = torch.load('best_ssd_model.pth')
+model.load_state_dict(checkpoint['model_state_dict'])
+
+# Calculate final mAP on validation set
+mAP = calculate_map(model, val_loader, device)
+print(f"Final mAP: {mAP:.4f}")
+
+# Save the final model
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'num_classes': num_classes,
+    'mAP': mAP
+}, 'ssd-object-detection-final.pth')
+
+print(f"Final model saved to ssd-object-detection-final.pth")
