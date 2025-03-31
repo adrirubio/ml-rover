@@ -1,36 +1,69 @@
 # SSD
-import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
-from transformers import AutoFeatureExtractor, AutoModelForObjectDetection
 from datasets import load_dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.colors import hsv_to_rgb
+import matplotlib.patches as patches
 from datetime import datetime
+import random
 
 # Define device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# Load the Pascal VOC dataset
-voc_dataset = load_dataset("EduardoLawson1/Pascal_voc")
- 
-# Split the train split into 90% train and 10% validation
-split_dataset = voc_dataset["train"].train_test_split(test_size=0.1, seed=42)
-train_dataset = split_dataset["train"]
-val_dataset = split_dataset["test"]
+# Load a subset of the COCO dataset
+print("Loading COCO dataset...")
+coco_dataset = load_dataset("detection-datasets/coco", trust_remote_code=True)
 
-# Define the VOC class labels
-VOC_CLASSES = [
-    'background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus',
-    'car', 'cat', 'chair', 'cow', 'diningtable', 'dog', 'horse', 'motorbike',
-    'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'
+# COCO has around 118K training images
+train_dataset_size = 10000
+val_dataset_size = 1000
+
+# Get a subset of the training data
+train_indices = random.sample(range(len(coco_dataset["train"])), train_dataset_size)
+train_dataset = coco_dataset["train"].select(train_indices)
+
+# Get a subset of the validation data
+val_indices = random.sample(range(len(coco_dataset["validation"])), val_dataset_size)
+val_dataset = coco_dataset["validation"].select(val_indices)
+
+print(f"Selected {len(train_dataset)} training images and {len(val_dataset)} validation images")
+
+# Print one sample to understand the dataset structure
+sample = train_dataset[0]
+print("Dataset sample keys:", sample.keys())
+if "objects" in sample:
+    print("First object in sample:", sample["objects"][0])
+elif "annotations" in sample:
+    print("First annotation in sample:", sample["annotations"][0])
+
+# We'll use a subset of classes to keep it manageable
+COCO_CLASSES = [
+    'background', 'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus',
+    'train', 'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
+    'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow'
 ]
+num_classes = len(COCO_CLASSES)
+
+# Create mapping from COCO category ID to our class index
+coco_id_to_class_idx = {0: 0}  # Background class has index 0
+for i, class_name in enumerate(COCO_CLASSES[1:], 1):  
+    # Find the COCO category ID for this class name
+    if "categories" in coco_dataset["train"].features:
+        category_info = next((cat for cat in coco_dataset["train"].features["categories"] if cat["name"] == class_name), None)
+        if category_info:
+            coco_id_to_class_idx[category_info["id"]] = i
+    else:
+        coco_id_to_class_idx[i] = i
+
+print(f"Using {len(COCO_CLASSES)} classes: {COCO_CLASSES}")
 
 # Define transforms with proper Albumentations pipeline
 train_transforms = A.Compose([
@@ -47,17 +80,66 @@ val_transforms = A.Compose([
     ToTensorV2()
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
-def convert_to_ssd_format(example, transform_fn):
+def convert_coco_to_ssd_format(example, transform_fn):
     # Convert image to numpy array
     img = np.array(example["image"])
-    
-    # Extract label
-    label = example.get("label", 0)
-    
-    # Create bounding box for the whole image
     height, width = img.shape[:2]
-    boxes = [[0, 0, width, height]]  # Default box covering whole image
-    labels = [label]
+    
+    # Extract bounding boxes and labels from the dataset
+    boxes = []
+    labels = []
+    
+    # Check which format the dataset uses
+    if "objects" in example and example["objects"]:
+        # Some HF datasets use 'objects' field
+        for obj in example["objects"]:
+            # Check if the object class is in our subset
+            if "category_id" in obj and obj["category_id"] in coco_id_to_class_idx:
+                # Convert COCO bbox [x, y, width, height] to Pascal VOC [xmin, ymin, xmax, ymax]
+                if "bbox" in obj:
+                    x, y, w, h = obj["bbox"]
+                    # Ensure bbox is within image bounds
+                    x = max(0, min(x, width - 1))
+                    y = max(0, min(y, height - 1))
+                    w = max(1, min(w, width - x))
+                    h = max(1, min(h, height - y))
+                    
+                    xmin = x
+                    ymin = y
+                    xmax = x + w
+                    ymax = y + h
+                    
+                    # Add box and label
+                    boxes.append([xmin, ymin, xmax, ymax])
+                    labels.append(coco_id_to_class_idx[obj["category_id"]])
+    
+    elif "annotations" in example and example["annotations"]:
+        # Official COCO uses 'annotations' field
+        for ann in example["annotations"]:
+            # Check if the object class is in our subset
+            if "category_id" in ann and ann["category_id"] in coco_id_to_class_idx:
+                # Convert COCO bbox [x, y, width, height] to Pascal VOC [xmin, ymin, xmax, ymax]
+                if "bbox" in ann:
+                    x, y, w, h = ann["bbox"]
+                    # Ensure bbox is within image bounds
+                    x = max(0, min(x, width - 1))
+                    y = max(0, min(y, height - 1))
+                    w = max(1, min(w, width - x))
+                    h = max(1, min(h, height - y))
+                    
+                    xmin = x
+                    ymin = y
+                    xmax = x + w
+                    ymax = y + h
+                    
+                    # Add box and label
+                    boxes.append([xmin, ymin, xmax, ymax])
+                    labels.append(coco_id_to_class_idx[ann["category_id"]])
+    
+    # If no valid boxes were found, create a default box
+    if not boxes:
+        boxes = [[0, 0, width, height]]  # Default box covering whole image
+        labels = [0]  # Background class
     
     # Apply transform
     transformed = transform_fn(image=img, bboxes=boxes, labels=labels)
@@ -82,10 +164,10 @@ def convert_to_ssd_format(example, transform_fn):
 
 # Create mapping functions for training and validation datasets
 def train_mapper(example):
-    return convert_to_ssd_format(example, train_transforms)
+    return convert_coco_to_ssd_format(example, train_transforms)
 
 def val_mapper(example):
-    return convert_to_ssd_format(example, val_transforms)
+    return convert_coco_to_ssd_format(example, val_transforms)
 
 # Define a collate function that handles variable-sized objects properly
 def custom_collate_fn(batch):
@@ -108,15 +190,17 @@ def custom_collate_fn(batch):
     }
 
 # Map the datasets
+print("Processing training dataset...")
 mapped_train_dataset = train_dataset.map(
     train_mapper,  
-    remove_columns=["image", "label"],
+    remove_columns=train_dataset.column_names,
     num_proc=8
 )
 
+print("Processing validation dataset...")
 mapped_val_dataset = val_dataset.map(
     val_mapper,
-    remove_columns=["image", "label"],
+    remove_columns=val_dataset.column_names,
     num_proc=8
 )
 
@@ -125,7 +209,7 @@ train_loader = DataLoader(
     mapped_train_dataset, 
     batch_size=32, 
     shuffle=True, 
-    num_workers=4,  # Using 4 parallel workers
+    num_workers=4,
     collate_fn=custom_collate_fn  
 )   
 
