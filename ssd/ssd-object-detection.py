@@ -188,7 +188,7 @@ mapped_val_dataset = coco_val_dataset.map(
 # Create DataLoaders
 train_loader = DataLoader(
     mapped_train_dataset, 
-    batch_size=16,  # Smaller batch size for H100 memory optimization
+    batch_size=16,
     shuffle=True, 
     num_workers=4,
     collate_fn=custom_collate_fn  
@@ -846,7 +846,7 @@ def train_model(model, SSDLoss, optimizer, scheduler, train_loader, val_loader, 
     return train_losses, val_losses
 
 # Train the model
-num_epochs = 35  # Reduced epochs to fit within 1-2 hours on H100
+num_epochs = 35
 train_losses, val_losses = train_model(model, SSDLoss, optimizer, scheduler, train_loader, val_loader, epochs=num_epochs)
 
 # Plot training and validation losses
