@@ -23,8 +23,8 @@ print("Using device:", device)
 
 # Load COCO dataset from Hugging Face
 print("Loading COCO dataset...")
-coco_dataset = load_dataset("detection-datasets/coco", "2017", split="train[:15000]")  
-coco_val_dataset = load_dataset("detection-datasets/coco", "2017", split="validation[:3000]")
+coco_dataset = load_dataset("detection-datasets/coco", split="train[:15000]")  
+coco_val_dataset = load_dataset("detection-datasets/coco", split="validation[:3000]")
 
 # Get COCO categories (for class mapping)
 coco_categories = {cat['id']: idx + 1 for idx, cat in enumerate(coco_dataset.features['objects'].feature['category'].feature['id'].names.values())}
