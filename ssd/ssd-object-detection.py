@@ -23,8 +23,8 @@ print("Using device:", device)
 
 # Load COCO dataset from Hugging Face
 print("Loading COCO dataset...")
-coco_dataset = load_dataset("detection-datasets/coco", split="train[:15000]")  
-coco_val_dataset = load_dataset("detection-datasets/coco", split="validation[:3000]")
+coco_dataset = load_dataset("detection-datasets/coco", split="train[:20000]")  
+coco_val_dataset = load_dataset("detection-datasets/coco", split="validation[:5000]")
 
 # Get COCO categories (for class mapping)
 coco_categories = {cat['id']: idx + 1 for idx, cat in enumerate(coco_dataset.features['objects'].feature['category'].feature['id'].names.values())}
@@ -33,18 +33,45 @@ print(f"Number of classes: {num_classes}")
 
 # Define transforms with proper Albumentations pipeline
 train_transforms = A.Compose([
-    A.Resize(300, 300),  # Simple resize 
+    # Spatial transformations
+    A.Resize(height=300, width=300),
+    
+    # Flips and rotations
     A.HorizontalFlip(p=0.5),
-    A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1, p=0.5),
+    
+    # Color augmentations - simplified but effective
+    A.OneOf([
+        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=1.0),
+        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
+    ], p=0.5),
+    
+    # Light noise and blur - helps with robustness
+    A.OneOf([
+        A.GaussNoise(var_limit=(10.0, 30.0), p=1.0),
+        A.GaussianBlur(blur_limit=3, p=1.0),
+    ], p=0.2),
+    
+    # Occasional weather simulation
+    A.RandomShadow(p=0.2),
+    
+    # Normalize and convert to tensor
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+], bbox_params=A.BboxParams(format='pascal_voc', min_visibility=0.3, label_fields=['labels']))
+
+# Validation transformations
+val_transforms = A.Compose([
+    A.Resize(height=300, width=300),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
-val_transforms = A.Compose([
-    A.Resize(width=300, height=300),
+# Test transformations (for inference)
+test_transforms = A.Compose([
+    A.Resize(height=300, width=300),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
-], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
+])
 
 # Define dataset mapper functions
 def train_mapper(example):
