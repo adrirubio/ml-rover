@@ -17,6 +17,11 @@ import os
 import xml.etree.ElementTree as ET
 from PIL import Image
 
+# Set seeds for reproducibility
+torch.manual_seed(42)
+random.seed(42)
+np.random.seed(42)
+
 # Define device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -209,24 +214,25 @@ test_loader = DataLoader(
     collate_fn=custom_collate_fn
 )
 
-# Define SSD model with corrected BatchNorm layers
+# Define SSD model with corrected feature map sizes
 class SSD(nn.Module):
     def __init__(self, num_classes):
         super(SSD, self).__init__()
+        # Store num_classes as a class attribute
         self.num_classes = num_classes
-
+        
         # Load VGG16 with pretrained weights
         vgg = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
         features = list(vgg.features.children())
 
         # Extract features directly without adding extra BatchNorm2d
-        # First feature map (38x38)
+        # First feature map (37x37)
         self.conv1 = nn.Sequential(*features[:23])  # All VGG layers up to conv4_3
 
-        # Second feature map (19x19)
+        # Second feature map (18x18)
         self.conv2 = nn.Sequential(*features[23:30])  # Conv5 blocks
 
-        # Additional convolution layers (10x10)
+        # Additional convolution layers (18x18) - FC layers converted to Conv
         self.conv3 = nn.Sequential(
             nn.Conv2d(512, 1024, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
@@ -234,7 +240,7 @@ class SSD(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # (5x5)
+        # (9x9)
         self.conv4 = nn.Sequential(
             nn.Conv2d(1024, 256, kernel_size=1),
             nn.ReLU(inplace=True),
@@ -242,7 +248,7 @@ class SSD(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # (3x3)
+        # (5x5)
         self.conv5 = nn.Sequential(
             nn.Conv2d(512, 128, kernel_size=1),
             nn.ReLU(inplace=True),
@@ -250,17 +256,17 @@ class SSD(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # (1x1)
+        # (2x2)
         self.conv6 = nn.Sequential(
             nn.Conv2d(256, 128, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, stride=2),
+            nn.Conv2d(128, 256, kernel_size=3, padding=0, stride=2),  # No padding to get 2x2
             nn.ReLU(inplace=True),
         )
 
-        # Define anchor box configurations for each feature map
-        self.feature_maps = [38, 19, 10, 5, 3, 1]  # sizes of feature maps
-        self.steps = [8, 16, 32, 64, 100, 300]  # effective stride for each feature map
+        # Define actual feature map sizes based on the network architecture
+        self.feature_maps = [37, 18, 18, 9, 5, 2]  # Updated to match actual sizes
+        self.steps = [8, 16, 16, 32, 64, 100]  # effective stride for each feature map
         self.scales = [0.1, 0.2, 0.37, 0.54, 0.71, 0.88, 1.05]  # anchor box scales
         self.aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]  # aspect ratios for each feature map
         
@@ -346,22 +352,22 @@ class SSD(nn.Module):
         
         # Apply VGG layers and extract feature maps
         x = self.conv1(x)
-        sources.append(x)  # 38x38 feature map
+        sources.append(x)  # 37x37 feature map
         
         x = self.conv2(x)
-        sources.append(x)  # 19x19 feature map
+        sources.append(x)  # 18x18 feature map
         
         x = self.conv3(x)
-        sources.append(x)  # 10x10 feature map
+        sources.append(x)  # 18x18 feature map (different channels)
         
         x = self.conv4(x)
-        sources.append(x)  # 5x5 feature map
+        sources.append(x)  # 9x9 feature map
         
         x = self.conv5(x)
-        sources.append(x)  # 3x3 feature map
+        sources.append(x)  # 5x5 feature map
         
         x = self.conv6(x)
-        sources.append(x)  # 1x1 feature map
+        sources.append(x)  # 2x2 feature map
 
         # Apply prediction layers
         loc_preds = []
@@ -482,7 +488,7 @@ class SSD_loss(nn.Module):
             targets (dict): {"boxes": [list of GT boxes], "labels": [list of GT labels]}
         
         Returns:
-            torch.Tensor: Total loss
+            torch.Tensor: Total loss (scalar)
         """
         loc_preds, conf_preds, _ = predictions
         batch_size = loc_preds.size(0)
@@ -562,12 +568,17 @@ class SSD_loss(nn.Module):
         conf_loss = self.cross_entropy(conf_preds[pos_idx | neg_idx].view(-1, self.num_classes),
                                     conf_t[pos | neg].view(-1))
         
+        # Sum loss values to get a scalar
+        conf_loss = conf_loss.sum()
+        
         # Normalize by number of positive examples
         pos_count = max(1, num_pos)  # Avoid division by zero
         loc_loss /= pos_count
         conf_loss /= pos_count
         
-        return loc_loss + conf_loss
+        # Return scalar total loss
+        total_loss = loc_loss + conf_loss
+        return total_loss
 
 def decode_boxes(loc, default_boxes):
     """Decode predicted box coordinates from offsets"""
@@ -597,24 +608,41 @@ def decode_boxes(loc, default_boxes):
     
     return boxes
 
-def calculate_iou(box1, box2):
-    """Calculate IoU between two boxes"""
-    # Calculate intersection area
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-    
-    intersection = max(0, x2 - x1) * max(0, y2 - y1)
-    
-    # Calculate union area
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union = area1 + area2 - intersection
-    
-    return intersection / (union + 1e-10)
+# Fix for the device issue in decode_boxes function
 
-# Function to calculate mAP (simplified version for training feedback)
+def decode_boxes(loc, default_boxes):
+    """Decode predicted box coordinates from offsets"""
+    # Ensure both tensors are on the same device
+    device = loc.device
+    default_boxes = default_boxes.to(device)
+    
+    # Convert default boxes from (xmin, ymin, xmax, ymax) to (cx, cy, w, h)
+    def corner_to_center(boxes):
+        width = boxes[:, 2] - boxes[:, 0]
+        height = boxes[:, 3] - boxes[:, 1]
+        cx = boxes[:, 0] + width / 2
+        cy = boxes[:, 1] + height / 2
+        return torch.stack([cx, cy, width, height], dim=1)
+    
+    # Convert default boxes to center format
+    default_boxes_center = corner_to_center(default_boxes)
+    
+    # Decode predictions
+    pred_cx = loc[:, 0] * default_boxes_center[:, 2] + default_boxes_center[:, 0]
+    pred_cy = loc[:, 1] * default_boxes_center[:, 3] + default_boxes_center[:, 1]
+    pred_w = torch.exp(loc[:, 2]) * default_boxes_center[:, 2]
+    pred_h = torch.exp(loc[:, 3]) * default_boxes_center[:, 3]
+    
+    # Convert back to corner format
+    boxes = torch.zeros_like(loc)
+    boxes[:, 0] = pred_cx - pred_w / 2
+    boxes[:, 1] = pred_cy - pred_h / 2
+    boxes[:, 2] = pred_cx + pred_w / 2
+    boxes[:, 3] = pred_cy + pred_h / 2
+    
+    return boxes
+
+# Fix for calculate_ap function to ensure device consistency
 def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.5):
     """
     Calculate Average Precision for Pascal VOC
@@ -634,6 +662,9 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
             # Forward pass
             loc_preds, conf_preds, default_boxes = model(images)
             
+            # Ensure default_boxes is on the same device
+            default_boxes = default_boxes.to(device)
+            
             # Convert predictions to detections
             batch_size = loc_preds.size(0)
             for i in range(batch_size):
@@ -645,7 +676,7 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
                 
                 # Keep track of detections and ground truths
                 image_detections = []
-                for c in range(1, num_classes):  # Skip background class
+                for c in range(1, model.num_classes):  # Skip background class
                     class_scores = scores[:, c]
                     mask = class_scores > conf_threshold
                     
@@ -682,7 +713,7 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
     
     # Calculate AP for each class
     aps = []
-    for c in range(1, num_classes):  # Skip background class
+    for c in range(1, model.num_classes):  # Skip background class
         # Collect all detections and ground truths for this class
         class_detections = []
         class_gt_count = 0
@@ -712,9 +743,15 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
         
         # Match detections to ground truths
         for d_idx, detection in enumerate(class_detections):
-            # Find the image this detection came from
-            img_idx = next((i for i, dets in enumerate(all_detections) 
-                          if any(d['box'] is detection['box'] for d in dets)), None)
+            # Find which image this detection came from by looping through all_detections
+            img_idx = None
+            for i, img_dets in enumerate(all_detections):
+                for d in img_dets:
+                    if d is detection:  # Identity check (same object in memory)
+                        img_idx = i
+                        break
+                if img_idx is not None:
+                    break
             
             if img_idx is None:
                 fp[d_idx] = 1
@@ -774,6 +811,21 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
 # Instantiate the SSD model and send it to the GPU
 model = SSD(num_classes=num_classes)
 model.to(device)
+
+# Debug - verify the anchor box and prediction shape match
+with torch.no_grad():
+    dummy_input = torch.zeros(1, 3, 300, 300).to(device)
+    loc_preds, conf_preds, default_boxes = model(dummy_input)
+    print(f"Default boxes shape: {model.default_boxes.shape}")
+    print(f"Predictions shape: {loc_preds.shape}")
+    
+    # Calculate total anchor boxes from feature maps
+    total_boxes = 0
+    for i, f in enumerate(model.feature_maps):
+        num_boxes = f*f*model.num_anchors[i]
+        print(f"Feature map {i}: {f}x{f} with {model.num_anchors[i]} anchors = {num_boxes} boxes")
+        total_boxes += num_boxes
+    print(f"Total calculated boxes: {total_boxes}")
 
 # Initialize the SSD loss function
 SSDLoss = SSD_loss(
