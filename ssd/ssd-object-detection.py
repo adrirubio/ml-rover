@@ -5,7 +5,7 @@ from torch.utils.data import DataLoader, Dataset
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
-from torchvision.datasets import VOCDetection
+import torchvision.datasets as datasets
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import numpy as np
@@ -14,24 +14,120 @@ import matplotlib.patches as patches
 from datetime import datetime
 import random
 import os
+import xml.etree.ElementTree as ET
 from PIL import Image
-import json
 
 # Define device
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# Pascal VOC Classes
-VOC_CLASSES = [
-    'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 'car', 'cat',
-    'chair', 'cow', 'diningtable', 'dog', 'horse', 'motorbike', 'person',
-    'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'
-]
+# Pascal VOC class names
+VOC_CLASSES = (
+    'background',  # always index 0
+    'aeroplane', 'bicycle', 'bird', 'boat',
+    'bottle', 'bus', 'car', 'cat', 'chair',
+    'cow', 'diningtable', 'dog', 'horse',
+    'motorbike', 'person', 'pottedplant',
+    'sheep', 'sofa', 'train', 'tvmonitor'
+)
+num_classes = len(VOC_CLASSES)
+print(f"Number of classes: {num_classes}")
 
-# Number of classes (20 VOC classes + 1 background)
-num_classes = len(VOC_CLASSES) + 1
+# Define Pascal VOC Dataset
+class PascalVOCDataset(Dataset):
+    def __init__(self, root, year='2007', image_set='train', transforms=None):
+        """
+        Pascal VOC Dataset
+        
+        Args:
+            root (str): Path to VOCdevkit folder
+            year (str): Dataset year ('2007' or '2012')
+            image_set (str): Dataset type ('train', 'val', 'test')
+            transforms (callable, optional): Optional transforms to be applied
+        """
+        self.root = root
+        self.year = year
+        self.image_set = image_set
+        self.transforms = transforms
+        
+        # Paths
+        self.images_dir = os.path.join(root, f'VOC{year}', 'JPEGImages')
+        self.annotations_dir = os.path.join(root, f'VOC{year}', 'Annotations')
+        
+        # Load image ids
+        splits_dir = os.path.join(root, f'VOC{year}', 'ImageSets', 'Main')
+        split_file = os.path.join(splits_dir, f'{image_set}.txt')
+        
+        with open(split_file, 'r') as f:
+            self.ids = [x.strip() for x in f.readlines()]
+        
+        # Create class to index mapping
+        self.class_to_idx = {cls: i for i, cls in enumerate(VOC_CLASSES)}
+    
+    def __len__(self):
+        return len(self.ids)
+    
+    def __getitem__(self, index):
+        img_id = self.ids[index]
+        
+        # Load image
+        img_path = os.path.join(self.images_dir, f'{img_id}.jpg')
+        img = Image.open(img_path).convert('RGB')
+        img = np.array(img)
+        
+        # Load annotation
+        anno_path = os.path.join(self.annotations_dir, f'{img_id}.xml')
+        boxes, labels = self._parse_voc_xml(ET.parse(anno_path).getroot())
+        
+        sample = {
+            'image': img,
+            'bboxes': boxes,
+            'labels': labels
+        }
+        
+        # Apply transformations
+        if self.transforms:
+            sample = self.transforms(**sample)
+            
+        return {
+            'images': sample['image'],
+            'boxes': torch.FloatTensor(sample['bboxes']) if len(sample['bboxes']) > 0 else torch.zeros((0, 4)),
+            'labels': torch.LongTensor(sample['labels']) if len(sample['labels']) > 0 else torch.zeros(0, dtype=torch.long)
+        }
+    
+    def _parse_voc_xml(self, node):
+        """Parse Pascal VOC annotation XML file"""
+        boxes = []
+        labels = []
+        
+        for obj in node.findall('object'):
+            # Skip difficult objects if needed
+            # difficult = int(obj.find('difficult').text)
+            # if difficult:
+            #     continue
+            
+            name = obj.find('name').text
+            if name not in self.class_to_idx:
+                continue
+                
+            label = self.class_to_idx[name]
+            
+            bndbox = obj.find('bndbox')
+            xmin = float(bndbox.find('xmin').text)
+            ymin = float(bndbox.find('ymin').text)
+            xmax = float(bndbox.find('xmax').text)
+            ymax = float(bndbox.find('ymax').text)
+            
+            # Skip invalid boxes
+            if xmax <= xmin or ymax <= ymin or xmax <= 0 or ymax <= 0:
+                continue
+                
+            boxes.append([xmin, ymin, xmax, ymax])
+            labels.append(label)
+        
+        return boxes, labels
 
-# Define transforms with proper Albumentations pipeline
+# Define the transforms
 train_transforms = A.Compose([
     # Spatial transformations
     A.Resize(height=300, width=300),
@@ -47,7 +143,7 @@ train_transforms = A.Compose([
     
     # Light noise and blur - helps with robustness
     A.OneOf([
-        A.GaussNoise(var_limit=(10.0, 30.0), p=1.0),
+        A.GaussNoise(p=1.0),  # Fixed: removed var_limit parameter
         A.GaussianBlur(blur_limit=3, p=1.0),
     ], p=0.2),
     
@@ -66,89 +162,11 @@ val_transforms = A.Compose([
     ToTensorV2()
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
 
-# Test transformations (for inference)
-test_transforms = A.Compose([
-    A.Resize(height=300, width=300),
-    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ToTensorV2()
-])
-
-# Custom Pascal VOC Dataset
-class VOCDataset(Dataset):
-    def __init__(self, root, year='2007', image_set='train', transforms=None):
-        self.voc = VOCDetection(
-            root=root,
-            year=year,
-            image_set=image_set,
-            download=True
-        )
-        self.transforms = transforms
-        
-    def __len__(self):
-        return len(self.voc)
-    
-    def __getitem__(self, idx):
-        img, target = self.voc[idx]
-        
-        # Extract bounding boxes and labels from VOC annotation format
-        boxes = []
-        labels = []
-        
-        for obj in target['annotation']['object']:
-            bbox = obj['bndbox']
-            xmin = float(bbox['xmin'])
-            ymin = float(bbox['ymin'])
-            xmax = float(bbox['xmax'])
-            ymax = float(bbox['ymax'])
-            
-            # Get class label (convert class name to index)
-            label = VOC_CLASSES.index(obj['name'])
-            
-            boxes.append([xmin, ymin, xmax, ymax])
-            labels.append(label)
-            
-        # Convert to numpy arrays
-        boxes = np.array(boxes, dtype=np.float32)
-        labels = np.array(labels, dtype=np.int64)
-        
-        # Apply transformations
-        if self.transforms:
-            transformed = self.transforms(image=np.array(img), bboxes=boxes, labels=labels)
-            img = transformed['image']
-            boxes = np.array(transformed['bboxes'], dtype=np.float32)
-            labels = np.array(transformed['labels'], dtype=np.int64)
-        
-        # If no boxes left after transforms, return empty arrays
-        if len(boxes) == 0:
-            boxes = np.zeros((0, 4), dtype=np.float32)
-            labels = np.zeros((0), dtype=np.int64)
-        
-        # Convert to torch tensors
-        boxes = torch.from_numpy(boxes)
-        labels = torch.from_numpy(labels) + 1  # Add 1 because 0 is reserved for background
-        
-        return {
-            'images': img,
-            'boxes': boxes,
-            'labels': labels
-        }
-
-# Custom collate function for batching
-def collate_fn(batch):
-    """Custom collate function to handle variable sized boxes and labels."""
-    images = []
-    boxes = []
-    labels = []
-    
-    for item in batch:
-        images.append(item['images'])
-        boxes.append(item['boxes'])
-        labels.append(item['labels'])
-    
-    # Stack images into a batch
-    images = torch.stack(images, 0)
-    
-    # No stacking for boxes and labels since they have variable sizes
+# Custom collate function to handle variable size boxes and labels
+def custom_collate_fn(batch):
+    images = torch.stack([item['images'] for item in batch])
+    boxes = [item['boxes'] for item in batch]
+    labels = [item['labels'] for item in batch]
     
     return {
         'images': images,
@@ -156,62 +174,87 @@ def collate_fn(batch):
         'labels': labels
     }
 
-# Define model 
+# Create datasets
+# Set the correct path to your VOCdevkit directory
+voc_root = '/home/adrian/ml-rover/VOCdevkit/VOCdevkit'  # Update this path
+
+# For 2007 dataset
+train_dataset = PascalVOCDataset(voc_root, year='2007', image_set='train', transforms=train_transforms)
+val_dataset = PascalVOCDataset(voc_root, year='2007', image_set='val', transforms=val_transforms)
+# Optionally add the test set for final evaluation
+test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test', transforms=val_transforms)
+
+# Create DataLoaders
+train_loader = DataLoader(
+    train_dataset, 
+    batch_size=16,
+    shuffle=True, 
+    num_workers=4,
+    collate_fn=custom_collate_fn  
+)   
+
+val_loader = DataLoader(
+    val_dataset, 
+    batch_size=16, 
+    shuffle=False, 
+    num_workers=4,
+    collate_fn=custom_collate_fn
+)
+
+test_loader = DataLoader(
+    test_dataset, 
+    batch_size=16, 
+    shuffle=False, 
+    num_workers=4,
+    collate_fn=custom_collate_fn
+)
+
+# Define SSD model with corrected BatchNorm layers
 class SSD(nn.Module):
     def __init__(self, num_classes):
         super(SSD, self).__init__()
+        self.num_classes = num_classes
+
+        # Load VGG16 with pretrained weights
         vgg = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
         features = list(vgg.features.children())
 
+        # Extract features directly without adding extra BatchNorm2d
         # First feature map (38x38)
-        self.conv1 = nn.Sequential(
-            *features[:16],  # First 16 layers of VGG
-            nn.BatchNorm2d(512)
-        )
+        self.conv1 = nn.Sequential(*features[:23])  # All VGG layers up to conv4_3
 
         # Second feature map (19x19)
-        self.conv2 = nn.Sequential(
-            *features[16:23],
-            nn.BatchNorm2d(512)
-        )
+        self.conv2 = nn.Sequential(*features[23:30])  # Conv5 blocks
 
         # Additional convolution layers (10x10)
         self.conv3 = nn.Sequential(
-            nn.Conv2d(512, 256, kernel_size=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(512, 1024, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(1024, 1024, kernel_size=1),
             nn.ReLU(inplace=True),
         )
 
         # (5x5)
         self.conv4 = nn.Sequential(
-            nn.Conv2d(256, 256, kernel_size=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(1024, 256, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(256, 512, kernel_size=3, padding=1, stride=2),
             nn.ReLU(inplace=True),
         )
 
         # (3x3)
         self.conv5 = nn.Sequential(
-            nn.Conv2d(256, 256, kernel_size=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(512, 128, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
             nn.ReLU(inplace=True),
         )
 
         # (1x1)
         self.conv6 = nn.Sequential(
-            nn.Conv2d(256, 256, kernel_size=1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(256, 128, kernel_size=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=2),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(128, 256, kernel_size=3, stride=2),
             nn.ReLU(inplace=True),
         )
 
@@ -227,22 +270,22 @@ class SSD(nn.Module):
             # 1 + extra scale for aspect ratio 1 + 2 for each additional aspect ratio
             self.num_anchors.append(2 + 2 * len(ar))
         
-        # Define location layers
+        # Define location layers with corrected output channels
         self.loc_layers = nn.ModuleList([
             nn.Conv2d(512, self.num_anchors[0] * 4, kernel_size=3, padding=1),  # For conv1
             nn.Conv2d(512, self.num_anchors[1] * 4, kernel_size=3, padding=1),  # For conv2
-            nn.Conv2d(256, self.num_anchors[2] * 4, kernel_size=3, padding=1),  # For conv3
-            nn.Conv2d(256, self.num_anchors[3] * 4, kernel_size=3, padding=1),  # For conv4
+            nn.Conv2d(1024, self.num_anchors[2] * 4, kernel_size=3, padding=1),  # For conv3
+            nn.Conv2d(512, self.num_anchors[3] * 4, kernel_size=3, padding=1),  # For conv4
             nn.Conv2d(256, self.num_anchors[4] * 4, kernel_size=3, padding=1),  # For conv5
             nn.Conv2d(256, self.num_anchors[5] * 4, kernel_size=3, padding=1)   # For conv6
         ])
 
-        # Define confidence layers
+        # Define confidence layers with corrected input channels
         self.conf_layers = nn.ModuleList([
             nn.Conv2d(512, self.num_anchors[0] * num_classes, kernel_size=3, padding=1),  # For conv1
             nn.Conv2d(512, self.num_anchors[1] * num_classes, kernel_size=3, padding=1),  # For conv2
-            nn.Conv2d(256, self.num_anchors[2] * num_classes, kernel_size=3, padding=1),  # For conv3
-            nn.Conv2d(256, self.num_anchors[3] * num_classes, kernel_size=3, padding=1),  # For conv4
+            nn.Conv2d(1024, self.num_anchors[2] * num_classes, kernel_size=3, padding=1),  # For conv3
+            nn.Conv2d(512, self.num_anchors[3] * num_classes, kernel_size=3, padding=1),  # For conv4
             nn.Conv2d(256, self.num_anchors[4] * num_classes, kernel_size=3, padding=1),  # For conv5
             nn.Conv2d(256, self.num_anchors[5] * num_classes, kernel_size=3, padding=1)   # For conv6
         ])
@@ -337,7 +380,7 @@ class SSD(nn.Module):
             conf = conf_layer(source)
             # Reshape to [batch_size, height, width, num_anchors * num_classes] then flatten
             conf = conf.permute(0, 2, 3, 1).contiguous()
-            conf = conf.view(batch_size, -1, num_classes)
+            conf = conf.view(batch_size, -1, self.num_classes)
             conf_preds.append(conf)
 
         # Concatenate predictions from different feature maps
@@ -572,8 +615,13 @@ def calculate_iou(box1, box2):
     return intersection / (union + 1e-10)
 
 # Function to calculate mAP (simplified version for training feedback)
-def calculate_map(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.5):
+def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.5):
+    """
+    Calculate Average Precision for Pascal VOC
+    """
     model.eval()
+    
+    # Initialize metrics
     all_detections = []
     all_ground_truths = []
     
@@ -596,7 +644,7 @@ def calculate_map(model, val_loader, device, iou_threshold=0.5, conf_threshold=0
                 scores = torch.nn.functional.softmax(conf_preds[i], dim=1)
                 
                 # Keep track of detections and ground truths
-                detections = []
+                image_detections = []
                 for c in range(1, num_classes):  # Skip background class
                     class_scores = scores[:, c]
                     mask = class_scores > conf_threshold
@@ -611,15 +659,15 @@ def calculate_map(model, val_loader, device, iou_threshold=0.5, conf_threshold=0
                     indices = torchvision.ops.nms(class_boxes, class_scores, iou_threshold)
                     
                     for idx in indices:
-                        detections.append({
+                        image_detections.append({
                             'box': class_boxes[idx].cpu().numpy(),
                             'score': class_scores[idx].item(),
                             'class': c
                         })
                 
-                all_detections.append(detections)
+                all_detections.append(image_detections)
                 
-                # Ground truths
+                # Process ground truths
                 gt_boxes_img = gt_boxes[i].cpu().numpy()
                 gt_labels_img = gt_labels[i].cpu().numpy()
                 ground_truths = []
@@ -632,61 +680,96 @@ def calculate_map(model, val_loader, device, iou_threshold=0.5, conf_threshold=0
                 
                 all_ground_truths.append(ground_truths)
     
-    # Simple mAP calculation
-    # This is a placeholder for efficiency during training
-    correct_detections = 0
-    total_detections = 1e-6  # Avoid division by zero
-    
-    for dets, gts in zip(all_detections, all_ground_truths):
-        total_detections += len(dets)
+    # Calculate AP for each class
+    aps = []
+    for c in range(1, num_classes):  # Skip background class
+        # Collect all detections and ground truths for this class
+        class_detections = []
+        class_gt_count = 0
         
-        for det in dets:
-            for gt in gts:
-                if det['class'] == gt['class']:
-                    # Calculate IoU
-                    iou = calculate_iou(det['box'], gt['box'])
-                    if iou >= iou_threshold:
-                        correct_detections += 1
-                        break
+        for img_idx in range(len(all_detections)):
+            # Get detections for this class
+            img_detections = [d for d in all_detections[img_idx] if d['class'] == c]
+            # Sort by confidence score (highest first)
+            img_detections.sort(key=lambda x: x['score'], reverse=True)
+            class_detections.extend(img_detections)
+            
+            # Count ground truths for this class
+            class_gt_count += sum(1 for gt in all_ground_truths[img_idx] if gt['class'] == c)
+        
+        # Skip classes with no ground truth objects
+        if class_gt_count == 0:
+            continue
+            
+        # Initialize tp and fp arrays
+        tp = np.zeros(len(class_detections))
+        fp = np.zeros(len(class_detections))
+        
+        # Create list of gt matches for each image
+        gt_matched = []
+        for gt_list in all_ground_truths:
+            gt_matched.append([False] * len(gt_list))
+        
+        # Match detections to ground truths
+        for d_idx, detection in enumerate(class_detections):
+            # Find the image this detection came from
+            img_idx = next((i for i, dets in enumerate(all_detections) 
+                          if any(d['box'] is detection['box'] for d in dets)), None)
+            
+            if img_idx is None:
+                fp[d_idx] = 1
+                continue
+                
+            gt_list = all_ground_truths[img_idx]
+            max_iou = -1
+            max_idx = -1
+            
+            # Find the best matching ground truth for this detection
+            for gt_idx, gt in enumerate(gt_list):
+                if gt['class'] != detection['class']:
+                    continue
+                    
+                # Skip already matched ground truths
+                if gt_matched[img_idx][gt_idx]:
+                    continue
+                    
+                # Calculate IoU
+                iou = calculate_iou(detection['box'], gt['box'])
+                if iou > max_iou:
+                    max_iou = iou
+                    max_idx = gt_idx
+            
+            # If IoU exceeds threshold, it's a true positive
+            if max_iou >= iou_threshold and max_idx >= 0:
+                tp[d_idx] = 1
+                gt_matched[img_idx][max_idx] = True
+            else:
+                fp[d_idx] = 1
+        
+        # Compute precision and recall
+        tp_cumsum = np.cumsum(tp)
+        fp_cumsum = np.cumsum(fp)
+        recalls = tp_cumsum / max(1, class_gt_count)
+        precisions = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-6)
+        
+        # Add point at recall=0, precision=1 for AP calculation
+        precisions = np.concatenate(([1], precisions))
+        recalls = np.concatenate(([0], recalls))
+        
+        # Compute AP as area under precision-recall curve (VOC method)
+        ap = 0
+        for t in np.arange(0, 1.1, 0.1):  # 11-point interpolation
+            if np.sum(recalls >= t) == 0:
+                p = 0
+            else:
+                p = np.max(precisions[recalls >= t])
+            ap += p / 11
+            
+        aps.append(ap)
     
-    return correct_detections / total_detections
-
-# Set up dataset paths
-data_root = 'data/VOC'  # This directory will be created if it doesn't exist
-
-# Create datasets
-train_dataset = VOCDataset(
-    root=data_root,
-    year='2007',
-    image_set='train',
-    transforms=train_transforms
-)
-
-val_dataset = VOCDataset(
-    root=data_root,
-    year='2007',
-    image_set='val',
-    transforms=val_transforms
-)
-
-# Create data loaders with appropriate batch size for H100
-train_loader = DataLoader(
-    train_dataset,
-    batch_size=32,  # Larger batch size for H100
-    shuffle=True,
-    num_workers=8,  # More workers for faster data loading
-    collate_fn=collate_fn,
-    pin_memory=True,  # Faster data transfer to GPU
-)
-
-val_loader = DataLoader(
-    val_dataset,
-    batch_size=32,
-    shuffle=False,
-    num_workers=8,
-    collate_fn=collate_fn,
-    pin_memory=True,
-)
+    # Mean AP across all classes
+    mAP = np.mean(aps) if aps else 0
+    return mAP
 
 # Instantiate the SSD model and send it to the GPU
 model = SSD(num_classes=num_classes)
@@ -700,112 +783,146 @@ SSDLoss = SSD_loss(
 )
 
 # Freeze first 10 layers of the VGG backbone for faster training
-for idx, param in enumerate(model.conv1.parameters()):
-    layer_idx = idx // 2  # Each layer has weights and biases, so divide by 2
-    if layer_idx < 10:    # First 10 layers
+frozen_layers = 10
+layer_count = 0
+for param in model.conv1.parameters():
+    if layer_count < frozen_layers * 2:  # Each layer has weights and biases
         param.requires_grad = False
+    layer_count += 1
 
-# Define optimizer with learning rate scheduling optimized for H100
-optimizer = optim.Adam([
-    {'params': model.conv1.parameters(), 'lr': 0.0002, 'weight_decay': 1e-4},
-    {'params': model.conv2.parameters(), 'lr': 0.0002, 'weight_decay': 1e-4},
-    {'params': model.conv3.parameters(), 'lr': 0.002, 'weight_decay': 1e-4},
-    {'params': model.conv4.parameters(), 'lr': 0.002, 'weight_decay': 1e-4},
-    {'params': model.conv5.parameters(), 'lr': 0.002, 'weight_decay': 1e-4},
-    {'params': model.conv6.parameters(), 'lr': 0.002, 'weight_decay': 1e-4},
-    {'params': model.loc_layers.parameters(), 'lr': 0.002, 'weight_decay': 1e-4},
-    {'params': model.conf_layers.parameters(), 'lr': 0.002, 'weight_decay': 1e-4}
-], betas=(0.9, 0.999))
+# Define optimizer with learning rate scheduling and weight decay
+optimizer = optim.AdamW([
+    {'params': [p for p in model.conv1.parameters() if p.requires_grad], 'lr': 0.0001},
+    {'params': model.conv2.parameters(), 'lr': 0.0005},
+    {'params': model.conv3.parameters(), 'lr': 0.001},
+    {'params': model.conv4.parameters(), 'lr': 0.001},
+    {'params': model.conv5.parameters(), 'lr': 0.001},
+    {'params': model.conv6.parameters(), 'lr': 0.001},
+    {'params': model.loc_layers.parameters(), 'lr': 0.001},
+    {'params': model.conf_layers.parameters(), 'lr': 0.001}
+], lr=0.001, weight_decay=5e-4)
 
-# Scheduler for faster convergence
-scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-    optimizer, 
-    mode='min', 
-    factor=0.7,  
-    patience=2,  
-    verbose=True
-)
+# Learning rate scheduler with warmup
+def get_lr_scheduler(optimizer, warmup_epochs=3, max_epochs=35):
+    # Define warmup scheduler (linear warmup)
+    def warmup_lambda(epoch):
+        if epoch < warmup_epochs:
+            return float(epoch) / float(max(1, warmup_epochs))
+        return 1.0
+    
+    warmup_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
+    
+    # Main scheduler (reduce on plateau)
+    reduce_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+    )
+    
+    return warmup_scheduler, reduce_scheduler
 
-# Training loop
-def train_model(model, SSDLoss, optimizer, scheduler, train_loader, val_loader, epochs):
-    train_losses = np.zeros(epochs)
-    val_losses = np.zeros(epochs)
+# Get schedulers
+warmup_scheduler, lr_scheduler = get_lr_scheduler(optimizer)
+
+# Training loop with improved logging and early stopping
+def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler, 
+                train_loader, val_loader, epochs, checkpoint_dir='./checkpoints'):
+    """
+    Training loop for SSD model
+    
+    Args:
+        model: SSD model
+        loss_fn: Loss function
+        optimizer: Optimizer
+        warmup_scheduler: Learning rate scheduler for warmup phase
+        lr_scheduler: Main learning rate scheduler
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        epochs: Number of epochs to train for
+        checkpoint_dir: Directory to save checkpoints
+    """
+    # Create checkpoint directory if it doesn't exist
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Initialize lists for tracking metrics
+    train_losses = []
+    val_losses = []
+    val_maps = []
     
     # For early stopping
+    best_val_map = 0
     best_val_loss = float('inf')
-    patience = 3
+    patience = 5
     patience_counter = 0
     
-    # For timing
-    start_time = datetime.now()
+    # Start training
+    print(f"Starting training for {epochs} epochs...")
     
-    for it in range(epochs):
+    for epoch in range(epochs):
+        # Training phase
         model.train()
-        t0 = datetime.now()
-        train_loss = []
-
+        epoch_loss = 0
+        batch_count = 0
+        
+        t_start = datetime.now()
+        print(f"Epoch {epoch+1}/{epochs}")
+        
         for batch_idx, batch in enumerate(train_loader):
-            images = batch['images']
+            # Move data to device
+            images = batch['images'].to(device)
             boxes = batch['boxes']
             labels = batch['labels']
             
-            # Move data to the appropriate device
-            images = images.to(device)
-            boxes = [b.to(device) for b in boxes]
-            labels = [l.to(device) for l in labels]
-
-            # Zero the parameter gradients
+            # Skip batches with no ground truth boxes
+            if all(b.size(0) == 0 for b in boxes):
+                continue
+                
+            # Zero gradients
             optimizer.zero_grad()
             
             # Forward pass
             loc_preds, conf_preds, default_boxes = model(images)
             
-            # Skip batches with no ground truth boxes
-            if all(b.size(0) == 0 for b in boxes):
-                continue
-            
             # Compute loss
-            loss = SSDLoss((loc_preds, conf_preds, default_boxes), {'boxes': boxes, 'labels': labels})
+            loss = loss_fn((loc_preds, conf_preds, default_boxes), {
+                'boxes': [b.to(device) for b in boxes],
+                'labels': [l.to(device) for l in labels]
+            })
             
-            # Backward pass and optimize
+            # Backward pass
             loss.backward()
             
-            # Gradient clipping to prevent explosion
+            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             
+            # Update weights
             optimizer.step()
-
-            train_loss.append(loss.item())
             
-            # Print progress
-            if (batch_idx + 1) % 20 == 0:
-                print(f"Epoch {it+1}/{epochs}, Batch {batch_idx+1}/{len(train_loader)}, Loss: {loss.item():.4f}")
-                
-                # Print estimated remaining time
-                elapsed = datetime.now() - start_time
-                progress = (it * len(train_loader) + batch_idx + 1) / (epochs * len(train_loader))
-                if progress > 0:
-                    estimated_total = elapsed / progress
-                    remaining = estimated_total - elapsed
-                    print(f"Elapsed: {elapsed}, Estimated remaining: {remaining}")
+            # Track metrics
+            epoch_loss += loss.item()
+            batch_count += 1
+            
+            # Print batch progress
+            if (batch_idx + 1) % 20 == 0 or batch_idx + 1 == len(train_loader):
+                print(f"  Batch {batch_idx+1}/{len(train_loader)} - Loss: {loss.item():.4f}")
         
-        # Get train loss mean
-        train_loss_mean = np.mean(train_loss) if train_loss else 0
-        train_losses[it] = train_loss_mean
-
+        # Update learning rate with warmup scheduler
+        if epoch < 3:  # Warmup phase
+            warmup_scheduler.step()
+        
+        # Calculate average training loss
+        avg_train_loss = epoch_loss / max(1, batch_count)
+        train_losses.append(avg_train_loss)
+        
         # Validation phase
         model.eval()
-        val_loss = []
+        val_loss = 0
+        val_batch_count = 0
+        
         with torch.no_grad():
-            for batch in val_loader:
-                images = batch['images']
+            for batch_idx, batch in enumerate(val_loader):
+                # Move data to device
+                images = batch['images'].to(device)
                 boxes = batch['boxes']
                 labels = batch['labels']
-                
-                # Move data to the appropriate device
-                images = images.to(device)
-                boxes = [b.to(device) for b in boxes]
-                labels = [l.to(device) for l in labels]
                 
                 # Skip batches with no ground truth boxes
                 if all(b.size(0) == 0 for b in boxes):
@@ -815,97 +932,252 @@ def train_model(model, SSDLoss, optimizer, scheduler, train_loader, val_loader, 
                 loc_preds, conf_preds, default_boxes = model(images)
                 
                 # Compute loss
-                loss = SSDLoss((loc_preds, conf_preds, default_boxes), {'boxes': boxes, 'labels': labels})
-
-                val_loss.append(loss.item())
-        
-        # Get validation loss mean
-        val_loss_mean = np.mean(val_loss) if val_loss else float('inf')
-        val_losses[it] = val_loss_mean
-        
-        # Update learning rate
-        scheduler.step(val_loss_mean)
-
-        # Calculate mAP on validation set every 5 epochs or on the last epoch
-        if (it + 1) % 5 == 0 or it == epochs - 1:
-            mAP = calculate_map(model, val_loader, device)
-            print(f"Epoch {it+1}, mAP: {mAP:.4f}")
-            
-            # If we've reached target accuracy, we can stop early
-            if mAP >= 0.7:  # 70% mAP
-                print(f"Reached target accuracy of {mAP:.4f} at epoch {it+1}")
+                loss = loss_fn((loc_preds, conf_preds, default_boxes), {
+                    'boxes': [b.to(device) for b in boxes],
+                    'labels': [l.to(device) for l in labels]
+                })
                 
-                # Save the model
-                torch.save({
-                    'epoch': it,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'mAP': mAP,
-                }, 'ssd_target_accuracy.pth')
-                
-                if mAP >= 0.75:  # If we hit the upper target, definitely stop
-                    print("Reached upper target accuracy, stopping training")
-                    break
+                # Track metrics
+                val_loss += loss.item()
+                val_batch_count += 1
         
-        dt = datetime.now() - t0
-        print(f'Epoch {it+1}/{epochs}, Train Loss: {train_loss_mean:.4f}, Validation Loss: {val_loss_mean:.4f}, Duration: {dt}')
+        # Calculate average validation loss
+        avg_val_loss = val_loss / max(1, val_batch_count)
+        val_losses.append(avg_val_loss)
         
-        # Early stopping check
-        if val_loss_mean < best_val_loss:
-            best_val_loss = val_loss_mean
+        # Calculate mAP on validation set (using a subset for speed)
+        print("Calculating validation mAP...")
+        val_map = calculate_ap(model, val_loader, device)
+        val_maps.append(val_map)
+        
+        # Update main learning rate scheduler based on validation loss
+        lr_scheduler.step(avg_val_loss)
+        
+        # Print epoch summary
+        t_end = datetime.now()
+        duration = t_end - t_start
+        print(f"  Epoch {epoch+1} completed in {duration}")
+        print(f"  Train Loss: {avg_train_loss:.4f}")
+        print(f"  Val Loss: {avg_val_loss:.4f}")
+        print(f"  Val mAP: {val_map:.4f}")
+        
+        # Save checkpoint if this is the best model so far
+        if val_map > best_val_map:
+            best_val_map = val_map
             patience_counter = 0
             
-            # Save the best model
+            print(f"  Saving best model with mAP: {best_val_map:.4f}")
             torch.save({
-                'epoch': it,
+                'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'loss': best_val_loss,
-            }, 'best_ssd_model.pth')
-            
+                'val_map': val_map,
+                'val_loss': avg_val_loss,
+            }, os.path.join(checkpoint_dir, 'best_model.pth'))
         else:
             patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping triggered after {it+1} epochs")
-                break
-                
-        # Check if we're reaching the time limit (1.5 hours)
-        if (datetime.now() - start_time).total_seconds() > 5400:  # 1.5 hours
-            print("Approaching time limit, stopping training")
+            print(f"  No improvement in val_map for {patience_counter} epochs")
+            
+            # Save periodic checkpoint
+            if (epoch + 1) % 5 == 0:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_map': val_map,
+                    'val_loss': avg_val_loss,
+                }, os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth'))
+        
+        # Early stopping check
+        if patience_counter >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs")
             break
+    
+    # Save final model
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'val_map': val_maps[-1],
+        'val_loss': val_losses[-1],
+    }, os.path.join(checkpoint_dir, 'final_model.pth'))
+    
+    # Return training history
+    return {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'val_maps': val_maps
+    }
 
-    total_time = datetime.now() - start_time
-    print(f"Total training time: {total_time}")
-    return train_losses, val_losses
+# Function to plot training history
+def plot_training_history(history):
+    """Plot training and validation metrics"""
+    plt.figure(figsize=(12, 8))
+    
+    # Plot training and validation losses
+    plt.subplot(2, 1, 1)
+    plt.plot(history['train_losses'], label='Training Loss')
+    plt.plot(history['val_losses'], label='Validation Loss')
+    plt.title('Training and Validation Losses')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot validation mAP
+    plt.subplot(2, 1, 2)
+    plt.plot(history['val_maps'], label='Validation mAP', color='green')
+    plt.title('Validation mAP')
+    plt.xlabel('Epoch')
+    plt.ylabel('mAP')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig('training_history.png')
+    plt.show()
+
+# Function to visualize detections
+def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
+    """
+    Visualize object detections on an image
+    
+    Args:
+        model: Trained SSD model
+        image_path: Path to the image
+        transform: Transforms to apply to the image
+        conf_threshold: Confidence threshold for detections
+    """
+    # Set model to evaluation mode
+    model.eval()
+    
+    # Load and transform image
+    image = Image.open(image_path).convert('RGB')
+    orig_image = np.array(image)
+    
+    # Apply transforms if provided
+    if transform:
+        transformed = transform(image=np.array(image))
+        image_tensor = transformed['image']
+    else:
+        # Default transform
+        transform = A.Compose([
+            A.Resize(height=300, width=300),
+            A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ToTensorV2()
+        ])
+        transformed = transform(image=np.array(image))
+        image_tensor = transformed['image']
+    
+    # Add batch dimension
+    image_tensor = image_tensor.unsqueeze(0).to(device)
+    
+    # Get predictions
+    with torch.no_grad():
+        loc_preds, conf_preds, default_boxes = model(image_tensor)
+        
+        # Decode predictions
+        decoded_boxes = decode_boxes(loc_preds[0], default_boxes)
+        
+        # Get confidence scores
+        scores = torch.nn.functional.softmax(conf_preds[0], dim=1)
+        
+        # Get detections with confidence > threshold
+        detections = []
+        
+        for class_idx in range(1, num_classes):  # Skip background class
+            class_scores = scores[:, class_idx]
+            mask = class_scores > conf_threshold
+            
+            if mask.sum() == 0:
+                continue
+                
+            class_boxes = decoded_boxes[mask]
+            class_scores = class_scores[mask]
+            
+            # Apply non-maximum suppression
+            keep_idx = torchvision.ops.nms(class_boxes, class_scores, iou_threshold=0.45)
+            
+            for idx in keep_idx:
+                detections.append({
+                    'box': class_boxes[idx].cpu().numpy(),
+                    'score': class_scores[idx].item(),
+                    'class': class_idx
+                })
+    
+    # Visualize detections
+    plt.figure(figsize=(12, 8))
+    plt.imshow(orig_image)
+    
+    # Plot each detection
+    for det in detections:
+        box = det['box']
+        score = det['score']
+        class_idx = det['class']
+        
+        # Scale box coordinates to original image size
+        h, w, _ = orig_image.shape
+        x1, y1, x2, y2 = box
+        x1 = int(x1 * w)
+        y1 = int(y1 * h)
+        x2 = int(x2 * w)
+        y2 = int(y2 * h)
+        
+        # Create rectangle patch
+        rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, 
+                                edgecolor='r', facecolor='none')
+        plt.gca().add_patch(rect)
+        
+        # Add label
+        class_name = VOC_CLASSES[class_idx]
+        plt.text(x1, y1-5, f'{class_name}: {score:.2f}', 
+                 fontsize=10, color='white', 
+                 bbox=dict(facecolor='red', alpha=0.7))
+    
+    plt.title('Object Detections')
+    plt.axis('off')
+    plt.savefig('detections.png')
+    plt.show()
 
 # Train the model
-num_epochs = 20 
-train_losses, val_losses = train_model(model, SSDLoss, optimizer, scheduler, train_loader, val_loader, epochs=num_epochs)
+print("Starting model training...")
+history = train_model(
+    model=model,
+    loss_fn=SSDLoss,
+    optimizer=optimizer,
+    warmup_scheduler=warmup_scheduler,
+    lr_scheduler=lr_scheduler,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    epochs=35
+)
 
-# Plot training and validation losses
-plt.figure(figsize=(10, 5))
-plt.plot(train_losses[:len(train_losses[train_losses > 0])], label='train loss')
-plt.plot(val_losses[:len(val_losses[val_losses > 0])], label='validation loss')
-plt.xlabel('Epochs')
-plt.ylabel('Loss')
-plt.title('Training and Validation Losses')
-plt.legend()
-plt.savefig('ssd_training_loss.png')
-plt.show()
+# Plot training history
+plot_training_history(history)
 
-# Load the best model
-checkpoint = torch.load('best_ssd_model.pth')
-model.load_state_dict(checkpoint['model_state_dict'])
+# Load the best model and evaluate
+best_model_path = os.path.join('checkpoints', 'best_model.pth')
+if os.path.exists(best_model_path):
+    checkpoint = torch.load(best_model_path)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"Loaded best model with validation mAP: {checkpoint['val_map']:.4f}")
+    
+    # Calculate final mAP on full validation set
+    final_map = calculate_ap(model, val_loader, device)
+    print(f"Final mAP on validation set: {final_map:.4f}")
+else:
+    print("No best model checkpoint found. Using final trained model.")
 
-# Calculate final mAP on validation set
-mAP = calculate_map(model, val_loader, device)
-print(f"Final mAP: {mAP:.4f}")
-
-# Save the final model
+# Save the final model in a format suitable for inference
+final_model_path = 'ssd_pascal_voc_final.pth'
 torch.save({
     'model_state_dict': model.state_dict(),
     'num_classes': num_classes,
-    'mAP': mAP
-}, 'ssd-object-detection-final.pth')
+    'class_names': VOC_CLASSES
+}, final_model_path)
 
-print(f"Final model saved to ssd-object-detection-final.pth")
+print(f"Final model saved to {final_model_path}")
+
+# Example of how to use the model for inference
+# Replace 'path/to/test/image.jpg' with an actual image path
+# visualize_detections(model, 'path/to/test/image.jpg')
