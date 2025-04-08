@@ -214,7 +214,7 @@ test_loader = DataLoader(
     collate_fn=custom_collate_fn
 )
 
-# Define SSD model with corrected feature map sizes
+# Define SSD model
 class SSD(nn.Module):
     def __init__(self, num_classes):
         super(SSD, self).__init__()
