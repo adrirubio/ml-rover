@@ -642,10 +642,18 @@ def decode_boxes(loc, default_boxes):
     
     return boxes
 
-# Fix for calculate_ap function to ensure device consistency
-def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.5):
+def calculate_ap_safe(model, val_dataset, device, batch_size=1, iou_threshold=0.5, conf_threshold=0.5, max_samples=100):
     """
-    Calculate Average Precision for Pascal VOC
+    Calculate Average Precision for Pascal VOC with safer processing approach
+    
+    Args:
+        model: The SSD model
+        val_dataset: Validation dataset
+        device: Device to run evaluation on
+        batch_size: Batch size for evaluation (use smaller values for stability)
+        iou_threshold: IoU threshold for detection matching
+        conf_threshold: Confidence threshold for detections
+        max_samples: Maximum number of samples to evaluate (for speed)
     """
     model.eval()
     
@@ -653,8 +661,23 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
     all_detections = []
     all_ground_truths = []
     
+    # Create a simple dataloader with no multiprocessing
+    safe_loader = DataLoader(
+        val_dataset, 
+        batch_size=batch_size,
+        shuffle=False, 
+        num_workers=0,  # No multiprocessing
+        collate_fn=custom_collate_fn
+    )
+    
+    # Limit the number of samples for faster evaluation during training
+    sample_count = 0
+    
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in safe_loader:
+            if sample_count >= max_samples:
+                break
+                
             images = batch['images'].to(device)
             gt_boxes = batch['boxes']
             gt_labels = batch['labels']
@@ -668,6 +691,10 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
             # Convert predictions to detections
             batch_size = loc_preds.size(0)
             for i in range(batch_size):
+                sample_count += 1
+                if sample_count > max_samples:
+                    break
+                    
                 # Decode locations
                 detected_boxes = decode_boxes(loc_preds[i], default_boxes)
                 
@@ -711,8 +738,12 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
                 
                 all_ground_truths.append(ground_truths)
     
+    print(f"Calculated mAP on {sample_count} samples")
+    
     # Calculate AP for each class
     aps = []
+    processed_classes = []
+    
     for c in range(1, model.num_classes):  # Skip background class
         # Collect all detections and ground truths for this class
         class_detections = []
@@ -731,7 +762,9 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
         # Skip classes with no ground truth objects
         if class_gt_count == 0:
             continue
-            
+        
+        processed_classes.append(VOC_CLASSES[c])
+        
         # Initialize tp and fp arrays
         tp = np.zeros(len(class_detections))
         fp = np.zeros(len(class_detections))
@@ -743,17 +776,18 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
         
         # Match detections to ground truths
         for d_idx, detection in enumerate(class_detections):
-            # Find which image this detection came from by looping through all_detections
-            img_idx = None
-            for i, img_dets in enumerate(all_detections):
-                for d in img_dets:
-                    if d is detection:  # Identity check (same object in memory)
+            # Find the image this detection belongs to
+            # This is tricky - we'll compare the detections one by one
+            img_idx = -1
+            for i, dets in enumerate(all_detections):
+                for det in dets:
+                    if (det['box'] == detection['box']).all() and det['class'] == detection['class'] and det['score'] == detection['score']:
                         img_idx = i
                         break
-                if img_idx is not None:
+                if img_idx != -1:
                     break
             
-            if img_idx is None:
+            if img_idx == -1:
                 fp[d_idx] = 1
                 continue
                 
@@ -803,9 +837,11 @@ def calculate_ap(model, val_loader, device, iou_threshold=0.5, conf_threshold=0.
             ap += p / 11
             
         aps.append(ap)
+        print(f"Class {VOC_CLASSES[c]}: AP = {ap:.4f} (GT: {class_gt_count}, Detections: {len(class_detections)})")
     
     # Mean AP across all classes
     mAP = np.mean(aps) if aps else 0
+    print(f"Processed classes: {processed_classes}")
     return mAP
 
 # Instantiate the SSD model and send it to the GPU
@@ -874,9 +910,9 @@ def get_lr_scheduler(optimizer, warmup_epochs=3, max_epochs=35):
 # Get schedulers
 warmup_scheduler, lr_scheduler = get_lr_scheduler(optimizer)
 
-# Training loop with improved logging and early stopping
+# Training loop
 def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler, 
-                train_loader, val_loader, epochs, checkpoint_dir='./checkpoints'):
+                train_loader, val_dataset, epochs, checkpoint_dir='./checkpoints'):
     """
     Training loop for SSD model
     
@@ -887,7 +923,7 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
         warmup_scheduler: Learning rate scheduler for warmup phase
         lr_scheduler: Main learning rate scheduler
         train_loader: Training data loader
-        val_loader: Validation data loader
+        val_dataset: Validation dataset (not loader)
         epochs: Number of epochs to train for
         checkpoint_dir: Directory to save checkpoints
     """
@@ -964,94 +1000,112 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
         avg_train_loss = epoch_loss / max(1, batch_count)
         train_losses.append(avg_train_loss)
         
-        # Validation phase
-        model.eval()
-        val_loss = 0
-        val_batch_count = 0
+        # Only validate every few epochs to save time
+        val_epoch = (epoch + 1) % 2 == 0 or epoch < 2 or epoch >= epochs - 3
         
-        with torch.no_grad():
-            for batch_idx, batch in enumerate(val_loader):
-                # Move data to device
-                images = batch['images'].to(device)
-                boxes = batch['boxes']
-                labels = batch['labels']
-                
-                # Skip batches with no ground truth boxes
-                if all(b.size(0) == 0 for b in boxes):
-                    continue
-                
-                # Forward pass
-                loc_preds, conf_preds, default_boxes = model(images)
-                
-                # Compute loss
-                loss = loss_fn((loc_preds, conf_preds, default_boxes), {
-                    'boxes': [b.to(device) for b in boxes],
-                    'labels': [l.to(device) for l in labels]
-                })
-                
-                # Track metrics
-                val_loss += loss.item()
-                val_batch_count += 1
-        
-        # Calculate average validation loss
-        avg_val_loss = val_loss / max(1, val_batch_count)
-        val_losses.append(avg_val_loss)
-        
-        # Calculate mAP on validation set (using a subset for speed)
-        print("Calculating validation mAP...")
-        val_map = calculate_ap(model, val_loader, device)
-        val_maps.append(val_map)
-        
-        # Update main learning rate scheduler based on validation loss
-        lr_scheduler.step(avg_val_loss)
-        
-        # Print epoch summary
-        t_end = datetime.now()
-        duration = t_end - t_start
-        print(f"  Epoch {epoch+1} completed in {duration}")
-        print(f"  Train Loss: {avg_train_loss:.4f}")
-        print(f"  Val Loss: {avg_val_loss:.4f}")
-        print(f"  Val mAP: {val_map:.4f}")
-        
-        # Save checkpoint if this is the best model so far
-        if val_map > best_val_map:
-            best_val_map = val_map
-            patience_counter = 0
+        if val_epoch:
+            # Validation phase for loss calculation
+            model.eval()
+            val_loss = 0
+            val_batch_count = 0
             
-            print(f"  Saving best model with mAP: {best_val_map:.4f}")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_map': val_map,
-                'val_loss': avg_val_loss,
-            }, os.path.join(checkpoint_dir, 'best_model.pth'))
-        else:
-            patience_counter += 1
-            print(f"  No improvement in val_map for {patience_counter} epochs")
+            # Create a simple validation loader with no multiprocessing
+            safe_val_loader = DataLoader(
+                val_dataset[:100],  # Only use a subset for validation
+                batch_size=4,
+                shuffle=False, 
+                num_workers=0,  # No multiprocessing
+                collate_fn=custom_collate_fn
+            )
             
-            # Save periodic checkpoint
-            if (epoch + 1) % 5 == 0:
+            with torch.no_grad():
+                for batch_idx, batch in enumerate(safe_val_loader):
+                    # Move data to device
+                    images = batch['images'].to(device)
+                    boxes = batch['boxes']
+                    labels = batch['labels']
+                    
+                    # Skip batches with no ground truth boxes
+                    if all(b.size(0) == 0 for b in boxes):
+                        continue
+                    
+                    # Forward pass
+                    loc_preds, conf_preds, default_boxes = model(images)
+                    
+                    # Compute loss
+                    loss = loss_fn((loc_preds, conf_preds, default_boxes), {
+                        'boxes': [b.to(device) for b in boxes],
+                        'labels': [l.to(device) for l in labels]
+                    })
+                    
+                    # Track metrics
+                    val_loss += loss.item()
+                    val_batch_count += 1
+            
+            # Calculate average validation loss
+            avg_val_loss = val_loss / max(1, val_batch_count)
+            val_losses.append(avg_val_loss)
+            
+            # Calculate mAP on validation set (using a subset for speed)
+            print("Calculating validation mAP...")
+            val_map = calculate_ap_safe(model, val_dataset, device, max_samples=50)
+            val_maps.append(val_map)
+            
+            # Update main learning rate scheduler based on validation loss
+            lr_scheduler.step(avg_val_loss)
+            
+            # Print epoch summary
+            t_end = datetime.now()
+            duration = t_end - t_start
+            print(f"  Epoch {epoch+1} completed in {duration}")
+            print(f"  Train Loss: {avg_train_loss:.4f}")
+            print(f"  Val Loss: {avg_val_loss:.4f}")
+            print(f"  Val mAP: {val_map:.4f}")
+            
+            # Save checkpoint if this is the best model so far
+            if val_map > best_val_map:
+                best_val_map = val_map
+                patience_counter = 0
+                
+                print(f"  Saving best model with mAP: {best_val_map:.4f}")
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_map': val_map,
                     'val_loss': avg_val_loss,
-                }, os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth'))
-        
-        # Early stopping check
-        if patience_counter >= patience:
-            print(f"Early stopping triggered after {epoch+1} epochs")
-            break
+                }, os.path.join(checkpoint_dir, 'best_model.pth'))
+            else:
+                patience_counter += 1
+                print(f"  No improvement in val_map for {patience_counter} epochs")
+                
+                # Save periodic checkpoint
+                if (epoch + 1) % 5 == 0:
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_map': val_map,
+                        'val_loss': avg_val_loss,
+                    }, os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth'))
+            
+            # Early stopping check
+            if patience_counter >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
+        else:
+            # Skip validation this epoch
+            print(f"  Epoch {epoch+1} - Train Loss: {avg_train_loss:.4f} (Validation skipped)")
+            t_end = datetime.now()
+            print(f"  Completed in {t_end - t_start}")
     
     # Save final model
     torch.save({
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'val_map': val_maps[-1],
-        'val_loss': val_losses[-1],
+        'val_map': val_maps[-1] if val_maps else 0,
+        'val_loss': val_losses[-1] if val_losses else float('inf'),
     }, os.path.join(checkpoint_dir, 'final_model.pth'))
     
     # Return training history
@@ -1060,6 +1114,17 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
         'val_losses': val_losses,
         'val_maps': val_maps
     }
+
+history = train_model(
+    model=model,
+    loss_fn=SSDLoss,
+    optimizer=optimizer,
+    warmup_scheduler=warmup_scheduler,
+    lr_scheduler=lr_scheduler,
+    train_loader=train_loader,
+    val_dataset=val_dataset,  
+    epochs=35
+)
 
 # Function to plot training history
 def plot_training_history(history):
