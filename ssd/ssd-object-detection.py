@@ -642,208 +642,6 @@ def decode_boxes(loc, default_boxes):
     
     return boxes
 
-def calculate_ap_safe(model, val_dataset, device, batch_size=1, iou_threshold=0.5, conf_threshold=0.5, max_samples=100):
-    """
-    Calculate Average Precision for Pascal VOC with safer processing approach
-    
-    Args:
-        model: The SSD model
-        val_dataset: Validation dataset
-        device: Device to run evaluation on
-        batch_size: Batch size for evaluation (use smaller values for stability)
-        iou_threshold: IoU threshold for detection matching
-        conf_threshold: Confidence threshold for detections
-        max_samples: Maximum number of samples to evaluate (for speed)
-    """
-    model.eval()
-    
-    # Initialize metrics
-    all_detections = []
-    all_ground_truths = []
-    
-    # Create a simple dataloader with no multiprocessing
-    safe_loader = DataLoader(
-        val_dataset, 
-        batch_size=batch_size,
-        shuffle=False, 
-        num_workers=0,  # No multiprocessing
-        collate_fn=custom_collate_fn
-    )
-    
-    # Limit the number of samples for faster evaluation during training
-    sample_count = 0
-    
-    with torch.no_grad():
-        for batch in safe_loader:
-            if sample_count >= max_samples:
-                break
-                
-            images = batch['images'].to(device)
-            gt_boxes = batch['boxes']
-            gt_labels = batch['labels']
-            
-            # Forward pass
-            loc_preds, conf_preds, default_boxes = model(images)
-            
-            # Ensure default_boxes is on the same device
-            default_boxes = default_boxes.to(device)
-            
-            # Convert predictions to detections
-            batch_size = loc_preds.size(0)
-            for i in range(batch_size):
-                sample_count += 1
-                if sample_count > max_samples:
-                    break
-                    
-                # Decode locations
-                detected_boxes = decode_boxes(loc_preds[i], default_boxes)
-                
-                # Get scores for each class
-                scores = torch.nn.functional.softmax(conf_preds[i], dim=1)
-                
-                # Keep track of detections and ground truths
-                image_detections = []
-                for c in range(1, model.num_classes):  # Skip background class
-                    class_scores = scores[:, c]
-                    mask = class_scores > conf_threshold
-                    
-                    if mask.sum() == 0:
-                        continue
-                        
-                    class_boxes = detected_boxes[mask]
-                    class_scores = class_scores[mask]
-                    
-                    # Non-maximum suppression
-                    indices = torchvision.ops.nms(class_boxes, class_scores, iou_threshold)
-                    
-                    for idx in indices:
-                        image_detections.append({
-                            'box': class_boxes[idx].cpu().numpy(),
-                            'score': class_scores[idx].item(),
-                            'class': c
-                        })
-                
-                all_detections.append(image_detections)
-                
-                # Process ground truths
-                gt_boxes_img = gt_boxes[i].cpu().numpy()
-                gt_labels_img = gt_labels[i].cpu().numpy()
-                ground_truths = []
-                
-                for box, label in zip(gt_boxes_img, gt_labels_img):
-                    ground_truths.append({
-                        'box': box,
-                        'class': label.item()
-                    })
-                
-                all_ground_truths.append(ground_truths)
-    
-    print(f"Calculated mAP on {sample_count} samples")
-    
-    # Calculate AP for each class
-    aps = []
-    processed_classes = []
-    
-    for c in range(1, model.num_classes):  # Skip background class
-        # Collect all detections and ground truths for this class
-        class_detections = []
-        class_gt_count = 0
-        
-        for img_idx in range(len(all_detections)):
-            # Get detections for this class
-            img_detections = [d for d in all_detections[img_idx] if d['class'] == c]
-            # Sort by confidence score (highest first)
-            img_detections.sort(key=lambda x: x['score'], reverse=True)
-            class_detections.extend(img_detections)
-            
-            # Count ground truths for this class
-            class_gt_count += sum(1 for gt in all_ground_truths[img_idx] if gt['class'] == c)
-        
-        # Skip classes with no ground truth objects
-        if class_gt_count == 0:
-            continue
-        
-        processed_classes.append(VOC_CLASSES[c])
-        
-        # Initialize tp and fp arrays
-        tp = np.zeros(len(class_detections))
-        fp = np.zeros(len(class_detections))
-        
-        # Create list of gt matches for each image
-        gt_matched = []
-        for gt_list in all_ground_truths:
-            gt_matched.append([False] * len(gt_list))
-        
-        # Match detections to ground truths
-        for d_idx, detection in enumerate(class_detections):
-            # Find the image this detection belongs to
-            # This is tricky - we'll compare the detections one by one
-            img_idx = -1
-            for i, dets in enumerate(all_detections):
-                for det in dets:
-                    if (det['box'] == detection['box']).all() and det['class'] == detection['class'] and det['score'] == detection['score']:
-                        img_idx = i
-                        break
-                if img_idx != -1:
-                    break
-            
-            if img_idx == -1:
-                fp[d_idx] = 1
-                continue
-                
-            gt_list = all_ground_truths[img_idx]
-            max_iou = -1
-            max_idx = -1
-            
-            # Find the best matching ground truth for this detection
-            for gt_idx, gt in enumerate(gt_list):
-                if gt['class'] != detection['class']:
-                    continue
-                    
-                # Skip already matched ground truths
-                if gt_matched[img_idx][gt_idx]:
-                    continue
-                    
-                # Calculate IoU
-                iou = calculate_iou(detection['box'], gt['box'])
-                if iou > max_iou:
-                    max_iou = iou
-                    max_idx = gt_idx
-            
-            # If IoU exceeds threshold, it's a true positive
-            if max_iou >= iou_threshold and max_idx >= 0:
-                tp[d_idx] = 1
-                gt_matched[img_idx][max_idx] = True
-            else:
-                fp[d_idx] = 1
-        
-        # Compute precision and recall
-        tp_cumsum = np.cumsum(tp)
-        fp_cumsum = np.cumsum(fp)
-        recalls = tp_cumsum / max(1, class_gt_count)
-        precisions = tp_cumsum / (tp_cumsum + fp_cumsum + 1e-6)
-        
-        # Add point at recall=0, precision=1 for AP calculation
-        precisions = np.concatenate(([1], precisions))
-        recalls = np.concatenate(([0], recalls))
-        
-        # Compute AP as area under precision-recall curve (VOC method)
-        ap = 0
-        for t in np.arange(0, 1.1, 0.1):  # 11-point interpolation
-            if np.sum(recalls >= t) == 0:
-                p = 0
-            else:
-                p = np.max(precisions[recalls >= t])
-            ap += p / 11
-            
-        aps.append(ap)
-        print(f"Class {VOC_CLASSES[c]}: AP = {ap:.4f} (GT: {class_gt_count}, Detections: {len(class_detections)})")
-    
-    # Mean AP across all classes
-    mAP = np.mean(aps) if aps else 0
-    print(f"Processed classes: {processed_classes}")
-    return mAP
-
 # Instantiate the SSD model and send it to the GPU
 model = SSD(num_classes=num_classes)
 model.to(device)
@@ -914,7 +712,6 @@ warmup_scheduler, lr_scheduler = get_lr_scheduler(optimizer)
 def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler, 
                 train_loader, val_dataset, epochs, checkpoint_dir='./checkpoints'):
     """
-    Training loop for SSD model
     
     Args:
         model: SSD model
@@ -923,20 +720,18 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
         warmup_scheduler: Learning rate scheduler for warmup phase
         lr_scheduler: Main learning rate scheduler
         train_loader: Training data loader
-        val_dataset: Validation dataset (not loader)
+        val_dataset: Validation dataset
         epochs: Number of epochs to train for
         checkpoint_dir: Directory to save checkpoints
     """
-    # Create checkpoint directory if it doesn't exist
+    # Create checkpoint directory
     os.makedirs(checkpoint_dir, exist_ok=True)
     
     # Initialize lists for tracking metrics
     train_losses = []
     val_losses = []
-    val_maps = []
     
     # For early stopping
-    best_val_map = 0
     best_val_loss = float('inf')
     patience = 5
     patience_counter = 0
@@ -1000,7 +795,7 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
         avg_train_loss = epoch_loss / max(1, batch_count)
         train_losses.append(avg_train_loss)
         
-        # Only validate every few epochs to save time
+        # Validation phase (only every few epochs)
         val_epoch = (epoch + 1) % 2 == 0 or epoch < 2 or epoch >= epochs - 3
         
         if val_epoch:
@@ -1009,9 +804,9 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
             val_loss = 0
             val_batch_count = 0
             
-            # Create a simple validation loader with no multiprocessing
+            # Create a validation loader with no multiprocessing
             safe_val_loader = DataLoader(
-                val_dataset[:100],  # Only use a subset for validation
+                val_dataset,
                 batch_size=4,
                 shuffle=False, 
                 num_workers=0,  # No multiprocessing
@@ -1041,15 +836,14 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
                     # Track metrics
                     val_loss += loss.item()
                     val_batch_count += 1
+                    
+                    # Limit validation to speed up training
+                    if batch_idx >= 25:  # Check ~100 validation images
+                        break
             
             # Calculate average validation loss
             avg_val_loss = val_loss / max(1, val_batch_count)
             val_losses.append(avg_val_loss)
-            
-            # Calculate mAP on validation set (using a subset for speed)
-            print("Calculating validation mAP...")
-            val_map = calculate_ap_safe(model, val_dataset, device, max_samples=50)
-            val_maps.append(val_map)
             
             # Update main learning rate scheduler based on validation loss
             lr_scheduler.step(avg_val_loss)
@@ -1060,24 +854,22 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
             print(f"  Epoch {epoch+1} completed in {duration}")
             print(f"  Train Loss: {avg_train_loss:.4f}")
             print(f"  Val Loss: {avg_val_loss:.4f}")
-            print(f"  Val mAP: {val_map:.4f}")
             
             # Save checkpoint if this is the best model so far
-            if val_map > best_val_map:
-                best_val_map = val_map
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
                 patience_counter = 0
                 
-                print(f"  Saving best model with mAP: {best_val_map:.4f}")
+                print(f"  Saving best model with validation loss: {best_val_loss:.4f}")
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
-                    'val_map': val_map,
                     'val_loss': avg_val_loss,
                 }, os.path.join(checkpoint_dir, 'best_model.pth'))
             else:
                 patience_counter += 1
-                print(f"  No improvement in val_map for {patience_counter} epochs")
+                print(f"  No improvement in validation loss for {patience_counter} epochs")
                 
                 # Save periodic checkpoint
                 if (epoch + 1) % 5 == 0:
@@ -1085,7 +877,6 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
                         'epoch': epoch,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'val_map': val_map,
                         'val_loss': avg_val_loss,
                     }, os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth'))
             
@@ -1104,49 +895,26 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'val_map': val_maps[-1] if val_maps else 0,
         'val_loss': val_losses[-1] if val_losses else float('inf'),
     }, os.path.join(checkpoint_dir, 'final_model.pth'))
     
     # Return training history
     return {
         'train_losses': train_losses,
-        'val_losses': val_losses,
-        'val_maps': val_maps
+        'val_losses': val_losses
     }
-
-history = train_model(
-    model=model,
-    loss_fn=SSDLoss,
-    optimizer=optimizer,
-    warmup_scheduler=warmup_scheduler,
-    lr_scheduler=lr_scheduler,
-    train_loader=train_loader,
-    val_dataset=val_dataset,  
-    epochs=35
-)
 
 # Function to plot training history
 def plot_training_history(history):
-    """Plot training and validation metrics"""
-    plt.figure(figsize=(12, 8))
+    """Plot training and validation metrics without mAP"""
+    plt.figure(figsize=(10, 6))
     
     # Plot training and validation losses
-    plt.subplot(2, 1, 1)
     plt.plot(history['train_losses'], label='Training Loss')
     plt.plot(history['val_losses'], label='Validation Loss')
     plt.title('Training and Validation Losses')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.legend()
-    plt.grid(True)
-    
-    # Plot validation mAP
-    plt.subplot(2, 1, 2)
-    plt.plot(history['val_maps'], label='Validation mAP', color='green')
-    plt.title('Validation mAP')
-    plt.xlabel('Epoch')
-    plt.ylabel('mAP')
     plt.legend()
     plt.grid(True)
     
@@ -1193,6 +961,9 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
     with torch.no_grad():
         loc_preds, conf_preds, default_boxes = model(image_tensor)
         
+        # Ensure default_boxes is on the same device
+        default_boxes = default_boxes.to(device)
+        
         # Decode predictions
         decoded_boxes = decode_boxes(loc_preds[0], default_boxes)
         
@@ -1202,7 +973,7 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
         # Get detections with confidence > threshold
         detections = []
         
-        for class_idx in range(1, num_classes):  # Skip background class
+        for class_idx in range(1, model.num_classes):  # Skip background class
             class_scores = scores[:, class_idx]
             mask = class_scores > conf_threshold
             
@@ -1256,7 +1027,7 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
     plt.savefig('detections.png')
     plt.show()
 
-# Train the model
+# Updated main training function call
 print("Starting model training...")
 history = train_model(
     model=model,
@@ -1265,23 +1036,19 @@ history = train_model(
     warmup_scheduler=warmup_scheduler,
     lr_scheduler=lr_scheduler,
     train_loader=train_loader,
-    val_loader=val_loader,
+    val_dataset=val_dataset, 
     epochs=35
 )
 
 # Plot training history
 plot_training_history(history)
 
-# Load the best model and evaluate
+# Load the best model
 best_model_path = os.path.join('checkpoints', 'best_model.pth')
 if os.path.exists(best_model_path):
     checkpoint = torch.load(best_model_path)
     model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"Loaded best model with validation mAP: {checkpoint['val_map']:.4f}")
-    
-    # Calculate final mAP on full validation set
-    final_map = calculate_ap(model, val_loader, device)
-    print(f"Final mAP on validation set: {final_map:.4f}")
+    print(f"Loaded best model with validation loss: {checkpoint['val_loss']:.4f}")
 else:
     print("No best model checkpoint found. Using final trained model.")
 
@@ -1294,7 +1061,3 @@ torch.save({
 }, final_model_path)
 
 print(f"Final model saved to {final_model_path}")
-
-# Example of how to use the model for inference
-# Replace 'path/to/test/image.jpg' with an actual image path
-# visualize_detections(model, 'path/to/test/image.jpg')
