@@ -35,6 +35,7 @@ VOC_CLASSES = (
     'motorbike', 'person', 'pottedplant',
     'sheep', 'sofa', 'train', 'tvmonitor'
 )
+
 num_classes = len(VOC_CLASSES)
 print(f"Number of classes: {num_classes}")
 
@@ -106,11 +107,6 @@ class PascalVOCDataset(Dataset):
         labels = []
         
         for obj in node.findall('object'):
-            # Skip difficult objects if needed
-            # difficult = int(obj.find('difficult').text)
-            # if difficult:
-            #     continue
-            
             name = obj.find('name').text
             if name not in self.class_to_idx:
                 continue
@@ -180,13 +176,12 @@ def custom_collate_fn(batch):
     }
 
 # Create datasets
-# Set the correct path to your VOCdevkit directory
-voc_root = '/home/adrian/ml-rover/VOCdevkit/VOCdevkit'  # Update this path
+voc_root = '/home/adrian/ml-rover/VOCdevkit/VOCdevkit'
 
 # For 2007 dataset
 train_dataset = PascalVOCDataset(voc_root, year='2007', image_set='train', transforms=train_transforms)
 val_dataset = PascalVOCDataset(voc_root, year='2007', image_set='val', transforms=val_transforms)
-# Optionally add the test set for final evaluation
+# Add test set for final evaluation 
 test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test', transforms=val_transforms)
 
 # Create DataLoaders
@@ -225,7 +220,6 @@ class SSD(nn.Module):
         vgg = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
         features = list(vgg.features.children())
 
-        # Extract features directly without adding extra BatchNorm2d
         # First feature map (37x37)
         self.conv1 = nn.Sequential(*features[:23])  # All VGG layers up to conv4_3
 
@@ -276,7 +270,7 @@ class SSD(nn.Module):
             # 1 + extra scale for aspect ratio 1 + 2 for each additional aspect ratio
             self.num_anchors.append(2 + 2 * len(ar))
         
-        # Define location layers with corrected output channels
+        # Define location layers with
         self.loc_layers = nn.ModuleList([
             nn.Conv2d(512, self.num_anchors[0] * 4, kernel_size=3, padding=1),  # For conv1
             nn.Conv2d(512, self.num_anchors[1] * 4, kernel_size=3, padding=1),  # For conv2
@@ -286,7 +280,7 @@ class SSD(nn.Module):
             nn.Conv2d(256, self.num_anchors[5] * 4, kernel_size=3, padding=1)   # For conv6
         ])
 
-        # Define confidence layers with corrected input channels
+        # Define confidence layers
         self.conf_layers = nn.ModuleList([
             nn.Conv2d(512, self.num_anchors[0] * num_classes, kernel_size=3, padding=1),  # For conv1
             nn.Conv2d(512, self.num_anchors[1] * num_classes, kernel_size=3, padding=1),  # For conv2
@@ -645,21 +639,6 @@ def decode_boxes(loc, default_boxes):
 # Instantiate the SSD model and send it to the GPU
 model = SSD(num_classes=num_classes)
 model.to(device)
-
-# Debug - verify the anchor box and prediction shape match
-with torch.no_grad():
-    dummy_input = torch.zeros(1, 3, 300, 300).to(device)
-    loc_preds, conf_preds, default_boxes = model(dummy_input)
-    print(f"Default boxes shape: {model.default_boxes.shape}")
-    print(f"Predictions shape: {loc_preds.shape}")
-    
-    # Calculate total anchor boxes from feature maps
-    total_boxes = 0
-    for i, f in enumerate(model.feature_maps):
-        num_boxes = f*f*model.num_anchors[i]
-        print(f"Feature map {i}: {f}x{f} with {model.num_anchors[i]} anchors = {num_boxes} boxes")
-        total_boxes += num_boxes
-    print(f"Total calculated boxes: {total_boxes}")
 
 # Initialize the SSD loss function
 SSDLoss = SSD_loss(
