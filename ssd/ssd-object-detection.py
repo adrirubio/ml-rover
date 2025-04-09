@@ -107,11 +107,7 @@ class PascalVOCDataset(Dataset):
         boxes = []
         labels = []
         
-<<<<<<< HEAD
-        for obj in node.findall('object'):         
-=======
         for obj in node.findall('object'):
->>>>>>> 849686a177c2e1a8d0efdc740ebd538e0b922563
             name = obj.find('name').text
             if name not in self.class_to_idx:
                 continue
@@ -186,10 +182,7 @@ voc_root = '/home/adrian/ml-rover/VOCdevkit/VOCdevkit'
 # For 2007 dataset
 train_dataset = PascalVOCDataset(voc_root, year='2007', image_set='train', transforms=train_transforms)
 val_dataset = PascalVOCDataset(voc_root, year='2007', image_set='val', transforms=val_transforms)
-<<<<<<< HEAD
-=======
 # Add test set for final evaluation 
->>>>>>> 849686a177c2e1a8d0efdc740ebd538e0b922563
 test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test', transforms=val_transforms)
 
 # Create DataLoaders
@@ -278,11 +271,7 @@ class SSD(nn.Module):
             # 1 + extra scale for aspect ratio 1 + 2 for each additional aspect ratio
             self.num_anchors.append(2 + 2 * len(ar))
         
-<<<<<<< HEAD
-        # Define location layers
-=======
         # Define location layers with
->>>>>>> 849686a177c2e1a8d0efdc740ebd538e0b922563
         self.loc_layers = nn.ModuleList([
             nn.Conv2d(512, self.num_anchors[0] * 4, kernel_size=3, padding=1),  # For conv1
             nn.Conv2d(512, self.num_anchors[1] * 4, kernel_size=3, padding=1),  # For conv2
@@ -629,6 +618,8 @@ def decode_boxes(loc, default_boxes):
     
     return boxes
 
+# Fix for the device issue in decode_boxes function
+
 def decode_boxes(loc, default_boxes):
     """Decode predicted box coordinates from offsets"""
     # Ensure both tensors are on the same device
@@ -682,15 +673,15 @@ for param in model.conv1.parameters():
 
 # Define optimizer with learning rate scheduling and weight decay
 optimizer = optim.AdamW([
-    {'params': [p for p in model.conv1.parameters() if p.requires_grad], 'lr': 0.0001},
-    {'params': model.conv2.parameters(), 'lr': 0.0005},
-    {'params': model.conv3.parameters(), 'lr': 0.001},
-    {'params': model.conv4.parameters(), 'lr': 0.001},
-    {'params': model.conv5.parameters(), 'lr': 0.001},
-    {'params': model.conv6.parameters(), 'lr': 0.001},
-    {'params': model.loc_layers.parameters(), 'lr': 0.001},
-    {'params': model.conf_layers.parameters(), 'lr': 0.001}
-], lr=0.001, weight_decay=1e-4)
+    {'params': [p for p in model.conv1.parameters() if p.requires_grad], 'lr': 0.00005},
+    {'params': model.conv2.parameters(), 'lr': 0.0002},
+    {'params': model.conv3.parameters(), 'lr': 0.0005},
+    {'params': model.conv4.parameters(), 'lr': 0.0005},
+    {'params': model.conv5.parameters(), 'lr': 0.0005},
+    {'params': model.conv6.parameters(), 'lr': 0.0005},
+    {'params': model.loc_layers.parameters(), 'lr': 0.0005},
+    {'params': model.conf_layers.parameters(), 'lr': 0.0005}
+], lr=0.0005, weight_decay=1e-4)
 
 # Learning rate scheduler with warmup
 def get_lr_scheduler(optimizer, warmup_epochs=5, max_epochs=50):
@@ -714,13 +705,8 @@ warmup_scheduler, cosine_scheduler = get_lr_scheduler(optimizer)
 
 # Training loop
 def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler, 
-<<<<<<< HEAD
-                train_loader, val_dataset, epochs, checkpoint_dir='./checkpoints'):
-    """  
-=======
                 train_loader, val_dataset, epochs, warmup_epochs=5, checkpoint_dir='./checkpoints'):
     """
->>>>>>> 849686a177c2e1a8d0efdc740ebd538e0b922563
     Args:
         model: SSD model
         loss_fn: Loss function
