@@ -2,6 +2,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
+from torch.cuda.amp import autocast, GradScaler
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
@@ -35,6 +36,7 @@ VOC_CLASSES = (
     'motorbike', 'person', 'pottedplant',
     'sheep', 'sofa', 'train', 'tvmonitor'
 )
+
 num_classes = len(VOC_CLASSES)
 print(f"Number of classes: {num_classes}")
 
@@ -105,7 +107,11 @@ class PascalVOCDataset(Dataset):
         boxes = []
         labels = []
         
+<<<<<<< HEAD
         for obj in node.findall('object'):         
+=======
+        for obj in node.findall('object'):
+>>>>>>> 849686a177c2e1a8d0efdc740ebd538e0b922563
             name = obj.find('name').text
             if name not in self.class_to_idx:
                 continue
@@ -143,7 +149,7 @@ train_transforms = A.Compose([
     
     # Light noise and blur - helps with robustness
     A.OneOf([
-        A.GaussNoise(p=1.0),  # Fixed: removed var_limit parameter
+        A.GaussNoise(p=1.0),
         A.GaussianBlur(blur_limit=3, p=1.0),
     ], p=0.2),
     
@@ -180,6 +186,10 @@ voc_root = '/home/adrian/ml-rover/VOCdevkit/VOCdevkit'
 # For 2007 dataset
 train_dataset = PascalVOCDataset(voc_root, year='2007', image_set='train', transforms=train_transforms)
 val_dataset = PascalVOCDataset(voc_root, year='2007', image_set='val', transforms=val_transforms)
+<<<<<<< HEAD
+=======
+# Add test set for final evaluation 
+>>>>>>> 849686a177c2e1a8d0efdc740ebd538e0b922563
 test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test', transforms=val_transforms)
 
 # Create DataLoaders
@@ -268,7 +278,11 @@ class SSD(nn.Module):
             # 1 + extra scale for aspect ratio 1 + 2 for each additional aspect ratio
             self.num_anchors.append(2 + 2 * len(ar))
         
+<<<<<<< HEAD
         # Define location layers
+=======
+        # Define location layers with
+>>>>>>> 849686a177c2e1a8d0efdc740ebd538e0b922563
         self.loc_layers = nn.ModuleList([
             nn.Conv2d(512, self.num_anchors[0] * 4, kernel_size=3, padding=1),  # For conv1
             nn.Conv2d(512, self.num_anchors[1] * 4, kernel_size=3, padding=1),  # For conv2
@@ -447,14 +461,16 @@ def encode_boxes(matched_boxes, default_boxes):
     return encoded_boxes
 
 class SSD_loss(nn.Module):
-    def __init__(self, num_classes, default_boxes, device):
+    def __init__(self, num_classes, default_boxes, device, alpha=0.25, gamma=2.0):
         """
-        SSD Loss function
+        SSD Loss function with Focal Loss
 
         Args:
             num_classes (int): Number of object classes
             default_boxes (torch.Tensor): Default anchor boxes (in corner format)
             device (torch.device): GPU or CPU
+            alpha (float): Weighting factor in focal loss
+            gamma (float): Focusing parameter in focal loss (higher means more focus on hard examples)
         """
         super(SSD_loss, self).__init__()
         
@@ -462,15 +478,45 @@ class SSD_loss(nn.Module):
         self.default_boxes = default_boxes.to(device)
         self.device = device
         
+        # Focal loss parameters
+        self.alpha = alpha
+        self.gamma = gamma
+        
         self.threshold = 0.5  # IoU threshold for positive matches
         self.neg_pos_ratio = 3  # Ratio of negative to positive samples
         
         self.smooth_l1 = nn.SmoothL1Loss(reduction='sum')
         self.cross_entropy = nn.CrossEntropyLoss(reduction='none')
     
+    def focal_loss(self, pred, target):
+        """
+        Compute focal loss for classification
+        
+        Args:
+            pred (torch.Tensor): Predicted class scores [N, num_classes]
+            target (torch.Tensor): Target classes [N]
+            
+        Returns:
+            torch.Tensor: Focal loss values
+        """
+        # Compute standard cross entropy loss
+        ce_loss = self.cross_entropy(pred, target)
+        
+        # Get probability of the target class (p_t)
+        pred_softmax = torch.nn.functional.softmax(pred, dim=1)
+        p_t = pred_softmax.gather(1, target.unsqueeze(1)).squeeze(1)
+        
+        # Calculate focal weight: alpha * (1-p_t)^gamma
+        focal_weight = self.alpha * (1 - p_t).pow(self.gamma)
+        
+        # Apply weight to cross entropy loss
+        focal_loss = focal_weight * ce_loss
+        
+        return focal_loss
+    
     def forward(self, predictions, targets):
         """
-        Compute SSD loss.
+        Compute SSD loss with focal loss for classification.
 
         Args:
             predictions (tuple): (loc_preds, conf_preds, default_boxes)
@@ -533,32 +579,15 @@ class SSD_loss(nn.Module):
         # Localization loss (only for positive matches)
         pos_idx = pos.unsqueeze(2).expand_as(loc_preds)
         loc_loss = self.smooth_l1(loc_preds[pos_idx].view(-1, 4), 
-                                 loc_t[pos_idx].view(-1, 4))
+                                  loc_t[pos_idx].view(-1, 4))
         
-        # Confidence loss
+        # Confidence loss with focal loss
         # Reshape confidence predictions to [batch_size * num_priors, num_classes]
         batch_conf = conf_preds.view(-1, self.num_classes)
-        # Compute softmax loss
-        loss_c = self.cross_entropy(batch_conf, conf_t.view(-1))
-        loss_c = loss_c.view(batch_size, -1)
         
-        # Hard negative mining
-        # Exclude positive examples from negative mining
-        loss_c[pos] = 0
-        # Sort confidence losses in descending order
-        _, loss_idx = loss_c.sort(1, descending=True)
-        _, idx_rank = loss_idx.sort(1)
-        # Number of negative examples to keep
-        num_pos_per_batch = pos.long().sum(1)
-        num_neg = torch.clamp(self.neg_pos_ratio * num_pos_per_batch, min=1, max=num_priors - 1)
-        # Keep only the selected negatives
-        neg = idx_rank < num_neg.unsqueeze(1)
-        
-        # Combine positive and selected negative examples for confidence loss
-        pos_idx = pos.unsqueeze(2).expand_as(conf_preds)
-        neg_idx = neg.unsqueeze(2).expand_as(conf_preds)
-        conf_loss = self.cross_entropy(conf_preds[pos_idx | neg_idx].view(-1, self.num_classes),
-                                    conf_t[pos | neg].view(-1))
+        # Use focal loss for all examples
+        # No need for hard negative mining since focal loss naturally handles class imbalance
+        conf_loss = self.focal_loss(batch_conf, conf_t.view(-1))
         
         # Sum loss values to get a scalar
         conf_loss = conf_loss.sum()
@@ -661,11 +690,11 @@ optimizer = optim.AdamW([
     {'params': model.conv6.parameters(), 'lr': 0.001},
     {'params': model.loc_layers.parameters(), 'lr': 0.001},
     {'params': model.conf_layers.parameters(), 'lr': 0.001}
-], lr=0.001, weight_decay=5e-4)
+], lr=0.001, weight_decay=1e-4)
 
 # Learning rate scheduler with warmup
-def get_lr_scheduler(optimizer, warmup_epochs=3, max_epochs=35):
-    # Define warmup scheduler (linear warmup)
+def get_lr_scheduler(optimizer, warmup_epochs=5, max_epochs=50):
+    # Define warmup scheduler
     def warmup_lambda(epoch):
         if epoch < warmup_epochs:
             return float(epoch) / float(max(1, warmup_epochs))
@@ -673,20 +702,25 @@ def get_lr_scheduler(optimizer, warmup_epochs=3, max_epochs=35):
     
     warmup_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
     
-    # Main scheduler (reduce on plateau)
-    reduce_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+    # Cosine annealing scheduler
+    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max_epochs-warmup_epochs, eta_min=1e-6
     )
     
-    return warmup_scheduler, reduce_scheduler
+    return warmup_scheduler, cosine_scheduler
 
 # Get schedulers
-warmup_scheduler, lr_scheduler = get_lr_scheduler(optimizer)
+warmup_scheduler, cosine_scheduler = get_lr_scheduler(optimizer)
 
 # Training loop
 def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler, 
+<<<<<<< HEAD
                 train_loader, val_dataset, epochs, checkpoint_dir='./checkpoints'):
     """  
+=======
+                train_loader, val_dataset, epochs, warmup_epochs=5, checkpoint_dir='./checkpoints'):
+    """
+>>>>>>> 849686a177c2e1a8d0efdc740ebd538e0b922563
     Args:
         model: SSD model
         loss_fn: Loss function
@@ -696,6 +730,7 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
         train_loader: Training data loader
         val_dataset: Validation dataset
         epochs: Number of epochs to train for
+        warmup_epochs: Number of warmup epochs
         checkpoint_dir: Directory to save checkpoints
     """
     # Create checkpoint directory
@@ -709,6 +744,9 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
     best_val_loss = float('inf')
     patience = 5
     patience_counter = 0
+    
+    # Initialize gradient scaler for mixed precision training
+    scaler = GradScaler()
     
     # Start training
     print(f"Starting training for {epochs} epochs...")
@@ -735,23 +773,26 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
             # Zero gradients
             optimizer.zero_grad()
             
-            # Forward pass
-            loc_preds, conf_preds, default_boxes = model(images)
+            # Forward pass with mixed precision
+            with autocast():
+                loc_preds, conf_preds, default_boxes = model(images)
+                
+                # Compute loss
+                loss = loss_fn((loc_preds, conf_preds, default_boxes), {
+                    'boxes': [b.to(device) for b in boxes],
+                    'labels': [l.to(device) for l in labels]
+                })
             
-            # Compute loss
-            loss = loss_fn((loc_preds, conf_preds, default_boxes), {
-                'boxes': [b.to(device) for b in boxes],
-                'labels': [l.to(device) for l in labels]
-            })
+            # Backward pass with scaled gradients
+            scaler.scale(loss).backward()
             
-            # Backward pass
-            loss.backward()
-            
-            # Gradient clipping
+            # Gradient clipping with scaling
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             
-            # Update weights
-            optimizer.step()
+            # Update weights with scaler
+            scaler.step(optimizer)
+            scaler.update()
             
             # Track metrics
             epoch_loss += loss.item()
@@ -761,14 +802,22 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
             if (batch_idx + 1) % 20 == 0 or batch_idx + 1 == len(train_loader):
                 print(f"  Batch {batch_idx+1}/{len(train_loader)} - Loss: {loss.item():.4f}")
         
-        # Update learning rate with warmup scheduler
-        if epoch < 3:  # Warmup phase
+        # Update learning rate schedulers
+        if epoch < warmup_epochs:
+            # During warmup phase, use only warmup scheduler
             warmup_scheduler.step()
-        
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"  Warmup phase: learning rate set to {current_lr:.6f}")
+        else:
+            # After warmup, use cosine annealing scheduler
+            lr_scheduler.step()  # Using lr_scheduler from function argument
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"  Cosine phase: learning rate set to {current_lr:.6f}")
+
         # Calculate average training loss
         avg_train_loss = epoch_loss / max(1, batch_count)
         train_losses.append(avg_train_loss)
-        
+
         # Validation phase (only every few epochs)
         val_epoch = (epoch + 1) % 2 == 0 or epoch < 2 or epoch >= epochs - 3
         
@@ -1008,10 +1057,11 @@ history = train_model(
     loss_fn=SSDLoss,
     optimizer=optimizer,
     warmup_scheduler=warmup_scheduler,
-    lr_scheduler=lr_scheduler,
+    lr_scheduler=cosine_scheduler,
     train_loader=train_loader,
     val_dataset=val_dataset, 
-    epochs=35
+    epochs=100,
+    warmup_epochs=5
 )
 
 # Plot training history
