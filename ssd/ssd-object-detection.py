@@ -592,36 +592,6 @@ class SSD_loss(nn.Module):
 
 def decode_boxes(loc, default_boxes):
     """Decode predicted box coordinates from offsets"""
-    # Convert default boxes from (xmin, ymin, xmax, ymax) to (cx, cy, w, h)
-    def corner_to_center(boxes):
-        width = boxes[:, 2] - boxes[:, 0]
-        height = boxes[:, 3] - boxes[:, 1]
-        cx = boxes[:, 0] + width / 2
-        cy = boxes[:, 1] + height / 2
-        return torch.stack([cx, cy, width, height], dim=1)
-    
-    # Convert default boxes to center format
-    default_boxes_center = corner_to_center(default_boxes)
-    
-    # Decode predictions
-    pred_cx = loc[:, 0] * default_boxes_center[:, 2] + default_boxes_center[:, 0]
-    pred_cy = loc[:, 1] * default_boxes_center[:, 3] + default_boxes_center[:, 1]
-    pred_w = torch.exp(loc[:, 2]) * default_boxes_center[:, 2]
-    pred_h = torch.exp(loc[:, 3]) * default_boxes_center[:, 3]
-    
-    # Convert back to corner format
-    boxes = torch.zeros_like(loc)
-    boxes[:, 0] = pred_cx - pred_w / 2
-    boxes[:, 1] = pred_cy - pred_h / 2
-    boxes[:, 2] = pred_cx + pred_w / 2
-    boxes[:, 3] = pred_cy + pred_h / 2
-    
-    return boxes
-
-# Fix for the device issue in decode_boxes function
-
-def decode_boxes(loc, default_boxes):
-    """Decode predicted box coordinates from offsets"""
     # Ensure both tensors are on the same device
     device = loc.device
     default_boxes = default_boxes.to(device)
