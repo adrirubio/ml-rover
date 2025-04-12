@@ -1,4 +1,4 @@
-# SSD
+# SSD   
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
@@ -17,6 +17,9 @@ import random
 import os
 import xml.etree.ElementTree as ET
 from PIL import Image
+from tqdm import tqdm
+from collections import defaultdict
+from torchvision.ops.boxes import box_convert, box_iou
 
 # Set seeds for reproducibility
 torch.manual_seed(42)
@@ -40,22 +43,26 @@ VOC_CLASSES = (
 num_classes = len(VOC_CLASSES)
 print(f"Number of classes: {num_classes}")
 
-# Define Pascal VOC Dataset
+# Define Pascal VOC Dataset with improved capabilities
 class PascalVOCDataset(Dataset):
-    def __init__(self, root, year='2007', image_set='train', transforms=None):
+    def __init__(self, root, year='2007', image_set='train', transforms=None, use_mosaic=False, mosaic_prob=0.5):
         """
-        Pascal VOC Dataset
+        Pascal VOC Dataset with enhanced augmentation
         
         Args:
             root (str): Path to VOCdevkit folder
             year (str): Dataset year ('2007' or '2012')
             image_set (str): Dataset type ('train', 'val', 'test')
-            transforms (callable, optional): Optional transforms to be applied
+            transforms (callable): Transforms to be applied
+            use_mosaic (bool): Whether to use mosaic augmentation
+            mosaic_prob (float): Probability of applying mosaic augmentation
         """
         self.root = root
         self.year = year
         self.image_set = image_set
         self.transforms = transforms
+        self.use_mosaic = use_mosaic and image_set == 'train'  # Only use mosaic for training
+        self.mosaic_prob = mosaic_prob
         
         # Paths
         self.images_dir = os.path.join(root, f'VOC{year}', 'JPEGImages')
@@ -74,7 +81,8 @@ class PascalVOCDataset(Dataset):
     def __len__(self):
         return len(self.ids)
     
-    def __getitem__(self, index):
+    def load_image_and_labels(self, index):
+        """Load image and annotations for a given index"""
         img_id = self.ids[index]
         
         # Load image
@@ -85,6 +93,15 @@ class PascalVOCDataset(Dataset):
         # Load annotation
         anno_path = os.path.join(self.annotations_dir, f'{img_id}.xml')
         boxes, labels = self._parse_voc_xml(ET.parse(anno_path).getroot())
+        
+        return img, boxes, labels
+    
+    def __getitem__(self, index):
+        # Decide whether to use mosaic
+        if self.use_mosaic and random.random() < self.mosaic_prob:
+            img, boxes, labels = self._load_mosaic(index)
+        else:
+            img, boxes, labels = self.load_image_and_labels(index)
         
         sample = {
             'image': img,
@@ -101,6 +118,79 @@ class PascalVOCDataset(Dataset):
             'boxes': torch.FloatTensor(sample['bboxes']) if len(sample['bboxes']) > 0 else torch.zeros((0, 4)),
             'labels': torch.LongTensor(sample['labels']) if len(sample['labels']) > 0 else torch.zeros(0, dtype=torch.long)
         }
+    
+    def _load_mosaic(self, index):
+        """
+        Loads 4 images and combines them in a mosaic pattern
+        """
+        # Get 3 more random indexes
+        indices = [index] + [random.randint(0, len(self.ids) - 1) for _ in range(3)]
+        
+        # Final image will be 2x the size before resizing
+        img_size = 1024  # This will later be resized to target size
+        
+        # Center of the mosaic
+        cx, cy = img_size // 2, img_size // 2
+        
+        # Initialize mosaic image and annotation lists
+        mosaic_img = np.zeros((img_size, img_size, 3), dtype=np.uint8)
+        mosaic_boxes = []
+        mosaic_labels = []
+        
+        # Mosaic quadrants
+        positions = [
+            [0, 0, cx, cy],          # top-left
+            [cx, 0, img_size, cy],   # top-right
+            [0, cy, cx, img_size],   # bottom-left
+            [cx, cy, img_size, img_size]  # bottom-right
+        ]
+        
+        for i, idx in enumerate(indices):
+            img, boxes, labels = self.load_image_and_labels(idx)
+            h, w = img.shape[:2]
+            
+            # Place image in mosaic
+            x1a, y1a, x2a, y2a = positions[i]  # mosaic position
+            
+            # Resize image to fit the quadrant
+            h_scale, w_scale = (y2a - y1a) / h, (x2a - x1a) / w
+            img_resized = cv2.resize(img, (x2a - x1a, y2a - y1a))
+            mosaic_img[y1a:y2a, x1a:x2a] = img_resized
+            
+            # Adjust box coordinates
+            if len(boxes) > 0:
+                # Scale box coordinates
+                boxes_scaled = boxes.copy()
+                boxes_scaled[:, 0] = w_scale * boxes[:, 0] + x1a
+                boxes_scaled[:, 1] = h_scale * boxes[:, 1] + y1a
+                boxes_scaled[:, 2] = w_scale * boxes[:, 2] + x1a
+                boxes_scaled[:, 3] = h_scale * boxes[:, 3] + y1a
+                
+                # Add boxes and labels
+                mosaic_boxes.extend(boxes_scaled)
+                mosaic_labels.extend(labels)
+        
+        # Clip boxes to image boundaries
+        if len(mosaic_boxes) > 0:
+            mosaic_boxes = np.array(mosaic_boxes)
+            mosaic_boxes[:, 0] = np.clip(mosaic_boxes[:, 0], 0, img_size)
+            mosaic_boxes[:, 1] = np.clip(mosaic_boxes[:, 1], 0, img_size)
+            mosaic_boxes[:, 2] = np.clip(mosaic_boxes[:, 2], 0, img_size)
+            mosaic_boxes[:, 3] = np.clip(mosaic_boxes[:, 3], 0, img_size)
+            
+            # Filter out invalid boxes
+            valid_boxes = []
+            valid_labels = []
+            
+            for box, label in zip(mosaic_boxes, mosaic_labels):
+                if box[2] > box[0] and box[3] > box[1]:  # width and height > 0
+                    valid_boxes.append(box)
+                    valid_labels.append(label)
+            
+            mosaic_boxes = valid_boxes
+            mosaic_labels = valid_labels
+        
+        return mosaic_img, mosaic_boxes, mosaic_labels
     
     def _parse_voc_xml(self, node):
         """Parse Pascal VOC annotation XML file"""
@@ -129,28 +219,43 @@ class PascalVOCDataset(Dataset):
         
         return boxes, labels
 
-# Define the transforms
+# Import required for mosaic augmentation
+import cv2
+
+# Define enhanced transforms with resolution 512x512
 train_transforms = A.Compose([
     # Spatial transformations
-    A.Resize(height=300, width=300),
+    A.Resize(height=512, width=512),
     
     # Flips and rotations
     A.HorizontalFlip(p=0.5),
+    A.RandomRotate90(p=0.2),
+    A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=15, p=0.3),
     
-    # Color augmentations - simplified but effective
+    # Color augmentations - enhanced
     A.OneOf([
-        A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=1.0),
-        A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
-    ], p=0.5),
+        A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.15, p=1.0),
+        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=1.0),
+        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=1.0),
+    ], p=0.7),
     
-    # Light noise and blur - helps with robustness
+    # Noise and blur - more aggressive
     A.OneOf([
-        A.GaussNoise(p=1.0),
-        A.GaussianBlur(blur_limit=3, p=1.0),
+        A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+        A.GaussianBlur(blur_limit=5, p=1.0),
+        A.MotionBlur(blur_limit=5, p=1.0),
+    ], p=0.3),
+    
+    # Weather simulation
+    A.OneOf([
+        A.RandomShadow(p=1.0),
+        A.RandomRain(drop_length=8, blur_value=3, p=1.0),
+        A.RandomFog(fog_coef_lower=0.1, fog_coef_upper=0.3, p=1.0),
     ], p=0.2),
     
-    # Occasional weather simulation
-    A.RandomShadow(p=0.2),
+    # Cutout/erasing
+    A.CoarseDropout(max_holes=8, max_height=64, max_width=64, min_holes=1, 
+                   min_height=32, min_width=32, fill_value=0, p=0.2),
     
     # Normalize and convert to tensor
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -159,7 +264,7 @@ train_transforms = A.Compose([
 
 # Validation transformations
 val_transforms = A.Compose([
-    A.Resize(height=300, width=300),
+    A.Resize(height=512, width=512),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
 ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
@@ -176,38 +281,43 @@ def custom_collate_fn(batch):
         'labels': labels
     }
 
-# Create datasets
+# Create datasets with mosaic augmentation
 voc_root = '/home/adrian/ml-rover/VOCdevkit/VOCdevkit'
 
 # For 2007 dataset
-train_dataset = PascalVOCDataset(voc_root, year='2007', image_set='train', transforms=train_transforms)
-val_dataset = PascalVOCDataset(voc_root, year='2007', image_set='val', transforms=val_transforms)
-# Add test set for final evaluation 
-test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test', transforms=val_transforms)
+train_dataset = PascalVOCDataset(voc_root, year='2007', image_set='train', 
+                                transforms=train_transforms, use_mosaic=True, mosaic_prob=0.5)
+val_dataset = PascalVOCDataset(voc_root, year='2007', image_set='val', 
+                              transforms=val_transforms)
+test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test', 
+                               transforms=val_transforms)
 
 # Create DataLoaders
 train_loader = DataLoader(
     train_dataset, 
-    batch_size=16,
+    batch_size=32,
     shuffle=True, 
     num_workers=4,
-    collate_fn=custom_collate_fn  
+    collate_fn=custom_collate_fn,
+    pin_memory=True
 )   
 
 val_loader = DataLoader(
     val_dataset, 
-    batch_size=16, 
+    batch_size=32, 
     shuffle=False, 
     num_workers=4,
-    collate_fn=custom_collate_fn
+    collate_fn=custom_collate_fn,
+    pin_memory=True
 )
 
 test_loader = DataLoader(
     test_dataset, 
-    batch_size=16, 
+    batch_size=32, 
     shuffle=False, 
     num_workers=4,
-    collate_fn=custom_collate_fn
+    collate_fn=custom_collate_fn,
+    pin_memory=True
 )
 
 # Define SSD model
