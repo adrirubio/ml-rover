@@ -833,8 +833,8 @@ def decode_boxes(loc, default_boxes):
     
     return boxes
 
-# Instantiate the SSD model and send it to the GPU
-model = SSD(num_classes=num_classes)
+# Instantiate the SSD model with COCO weights and send it to the GPU
+model = SSD(num_classes=num_classes, use_coco_weights=True)
 model.to(device)
 
 # Initialize the SSD loss function
@@ -844,29 +844,26 @@ SSDLoss = SSD_loss(
     device=device
 )
 
-# Freeze first 10 layers of the VGG backbone for faster training
-frozen_layers = 10
-layer_count = 0
-for param in model.conv1.parameters():
-    if layer_count < frozen_layers * 2:  # Each layer has weights and biases
+# Freeze first 2 feature extractors (first few layers of EfficientNet)
+for i in range(2):  # Freeze first 2 feature extractors
+    for param in model.feature_extractors[i].parameters():
         param.requires_grad = False
-    layer_count += 1
 
-# Define optimizer with learning rate scheduling and weight decay
-optimizer = optim.AdamW([
-    {'params': [p for p in model.conv1.parameters() if p.requires_grad], 'lr': 0.00005},
-    {'params': model.conv2.parameters(), 'lr': 0.0002},
-    {'params': model.conv3.parameters(), 'lr': 0.0005},
-    {'params': model.conv4.parameters(), 'lr': 0.0005},
-    {'params': model.conv5.parameters(), 'lr': 0.0005},
-    {'params': model.conv6.parameters(), 'lr': 0.0005},
-    {'params': model.loc_layers.parameters(), 'lr': 0.0005},
-    {'params': model.conf_layers.parameters(), 'lr': 0.0005}
-], lr=0.0005, weight_decay=1e-4)
+# Define optimizer with SGD and momentum
+optimizer = optim.SGD([
+    {'params': model.feature_extractors[2].parameters(), 'lr': 0.001},  # Medium feature extractor
+    {'params': model.feature_extractors[3].parameters(), 'lr': 0.001},  # Higher feature extractor
+    {'params': model.feature_extractors[4].parameters(), 'lr': 0.001},  # Highest feature extractor
+    {'params': model.extra_layer1.parameters(), 'lr': 0.002},
+    {'params': model.extra_layer2.parameters(), 'lr': 0.002},
+    {'params': model.fpn.parameters(), 'lr': 0.002},
+    {'params': model.loc_layers.parameters(), 'lr': 0.002},
+    {'params': model.conf_layers.parameters(), 'lr': 0.002}
+], lr=0.001, momentum=0.9, weight_decay=4e-5)
 
-# Learning rate scheduler with warmup
-def get_lr_scheduler(optimizer, warmup_epochs=5, max_epochs=50):
-    # Define warmup scheduler
+# Three-phase learning rate scheduler
+def get_three_phase_scheduler(optimizer, warmup_epochs=5, plateau_epochs=95, max_epochs=150):
+    # Define warmup phase (linear increase)
     def warmup_lambda(epoch):
         if epoch < warmup_epochs:
             return float(epoch) / float(max(1, warmup_epochs))
@@ -874,30 +871,212 @@ def get_lr_scheduler(optimizer, warmup_epochs=5, max_epochs=50):
     
     warmup_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
     
-    # Cosine annealing scheduler
+    # Define high plateau phase (constant)
+    plateau_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=plateau_epochs, gamma=1.0)
+    
+    # Define cosine decay phase
     cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max_epochs-warmup_epochs, eta_min=1e-6
+        optimizer, T_max=max_epochs-(warmup_epochs+plateau_epochs), eta_min=1e-6
     )
     
-    return warmup_scheduler, cosine_scheduler
+    return warmup_scheduler, plateau_scheduler, cosine_scheduler
 
-# Get schedulers
-warmup_scheduler, cosine_scheduler = get_lr_scheduler(optimizer)
+# Get schedulers for three-phase learning
+warmup_scheduler, plateau_scheduler, cosine_scheduler = get_three_phase_scheduler(
+    optimizer, warmup_epochs=5, plateau_epochs=95, max_epochs=150
+)
 
-# Training loop
-def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler, 
-                train_loader, val_dataset, epochs, warmup_epochs=5, checkpoint_dir='./checkpoints'):
+# mAP calculation function
+def calculate_mAP(model, data_loader, device, iou_threshold=0.5):
     """
+    Calculate Mean Average Precision (mAP) for object detection model
+    
+    Args:
+        model: SSD model
+        data_loader: DataLoader for evaluation data
+        device: Device to run evaluation on
+        iou_threshold: IoU threshold for considering a prediction as correct
+        
+    Returns:
+        float: mAP value
+    """
+    model.eval()
+    
+    # Initialize dictionaries to store predictions and ground truths
+    all_predictions = defaultdict(list)
+    all_ground_truths = defaultdict(list)
+    
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(tqdm(data_loader, desc='Calculating mAP')):
+            # Move data to device
+            images = batch['images'].to(device)
+            gt_boxes_batch = batch['boxes']
+            gt_labels_batch = batch['labels']
+            
+            # Forward pass
+            loc_preds, conf_preds, default_boxes = model(images)
+            
+            batch_size = images.size(0)
+            
+            # Process each image in the batch
+            for i in range(batch_size):
+                gt_boxes = gt_boxes_batch[i].to(device)
+                gt_labels = gt_labels_batch[i].to(device)
+                
+                # Skip if no ground truth boxes
+                if gt_boxes.size(0) == 0:
+                    continue
+                
+                # Store ground truths
+                for box, label in zip(gt_boxes, gt_labels):
+                    label_idx = label.item()
+                    if label_idx == 0:  # Skip background
+                        continue
+                    all_ground_truths[label_idx].append({
+                        'box': box.cpu().numpy(),
+                        'matched': False  # For matching predictions
+                    })
+                
+                # Process predictions
+                # Get confidence scores
+                scores = torch.nn.functional.softmax(conf_preds[i], dim=1)
+                
+                # Decode predicted boxes
+                decoded_boxes = decode_boxes(loc_preds[i], default_boxes)
+                
+                # For each class
+                for class_idx in range(1, model.num_classes):  # Skip background class
+                    class_scores = scores[:, class_idx]
+                    mask = class_scores > 0.01  # Low threshold to get more predictions
+                    
+                    if mask.sum() == 0:
+                        continue
+                    
+                    # Get boxes and scores for this class
+                    class_boxes = decoded_boxes[mask]
+                    class_scores_filtered = class_scores[mask]
+                    
+                    # Apply non-maximum suppression
+                    keep_idx = torchvision.ops.nms(class_boxes, class_scores_filtered, iou_threshold=0.45)
+                    
+                    # Store predictions
+                    for idx in keep_idx:
+                        all_predictions[class_idx].append({
+                            'box': class_boxes[idx].cpu().numpy(),
+                            'score': class_scores_filtered[idx].item()
+                        })
+    
+    # Calculate AP for each class
+    average_precisions = []
+    
+    # For each class
+    for class_idx in range(1, model.num_classes):  # Skip background
+        if class_idx not in all_predictions or class_idx not in all_ground_truths:
+            # Skip classes with no predictions or ground truths
+            continue
+        
+        # Sort predictions by descending score
+        predictions = sorted(all_predictions[class_idx], key=lambda x: x['score'], reverse=True)
+        
+        # Get total number of ground truths for this class
+        num_gts = len(all_ground_truths[class_idx])
+        
+        if num_gts == 0:
+            continue
+        
+        # Initialize lists for true positives and false positives
+        true_positives = []
+        false_positives = []
+        
+        # Process each prediction
+        for pred in predictions:
+            # Find the best matching ground truth
+            best_iou = -1
+            best_gt_idx = -1
+            
+            for gt_idx, gt in enumerate(all_ground_truths[class_idx]):
+                if gt['matched']:
+                    continue
+                
+                # Calculate IoU
+                iou = calculate_box_iou(pred['box'], gt['box'])
+                
+                if iou > best_iou:
+                    best_iou = iou
+                    best_gt_idx = gt_idx
+            
+            # Check if this prediction is a true positive
+            if best_iou >= iou_threshold:
+                all_ground_truths[class_idx][best_gt_idx]['matched'] = True
+                true_positives.append(1)
+                false_positives.append(0)
+            else:
+                true_positives.append(0)
+                false_positives.append(1)
+        
+        # Calculate cumulative sums
+        cum_true_positives = np.cumsum(true_positives)
+        cum_false_positives = np.cumsum(false_positives)
+        
+        # Calculate precision and recall
+        precision = cum_true_positives / (cum_true_positives + cum_false_positives)
+        recall = cum_true_positives / num_gts
+        
+        # Add a sentinel value at the end for AUC calculation
+        precision = np.append(precision, 0)
+        recall = np.append(recall, 1)
+        
+        # Compute AP using 11-point interpolation
+        ap = 0
+        for t in np.arange(0, 1.1, 0.1):
+            if np.sum(recall >= t) == 0:
+                p = 0
+            else:
+                p = np.max(precision[recall >= t])
+            ap += p / 11
+        
+        average_precisions.append(ap)
+    
+    # Calculate mean AP
+    mAP = np.mean(average_precisions) if average_precisions else 0.0
+    
+    return mAP
+
+def calculate_box_iou(box1, box2):
+    """Calculate IoU between two boxes"""
+    # Calculate intersection area
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    
+    # Calculate union area
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = area1 + area2 - intersection
+    
+    # Calculate IoU
+    iou = intersection / union if union > 0 else 0
+    
+    return iou
+
+# Training loop with mAP calculation
+def train_model(model, loss_fn, optimizer, warmup_scheduler, plateau_scheduler, cosine_scheduler, 
+                train_loader, val_loader, epochs, warmup_epochs=5, plateau_epochs=95, checkpoint_dir='./checkpoints'):
+    """
+    Enhanced training loop with three-phase learning rate schedule and mAP calculation
+    
     Args:
         model: SSD model
         loss_fn: Loss function
         optimizer: Optimizer
-        warmup_scheduler: Learning rate scheduler for warmup phase
-        lr_scheduler: Main learning rate scheduler
+        warmup_scheduler, plateau_scheduler, cosine_scheduler: Phase-specific schedulers
         train_loader: Training data loader
-        val_dataset: Validation dataset
+        val_loader: Validation data loader
         epochs: Number of epochs to train for
-        warmup_epochs: Number of warmup epochs
+        warmup_epochs, plateau_epochs: Lengths of the warmup and plateau phases
         checkpoint_dir: Directory to save checkpoints
     """
     # Create checkpoint directory
@@ -906,10 +1085,11 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
     # Initialize lists for tracking metrics
     train_losses = []
     val_losses = []
+    val_maps = []
     
     # For early stopping
-    best_val_loss = float('inf')
-    patience = 5
+    best_val_map = 0.0
+    patience = 7
     patience_counter = 0
     
     # Initialize gradient scaler for mixed precision training
@@ -927,7 +1107,7 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
         t_start = datetime.now()
         print(f"Epoch {epoch+1}/{epochs}")
         
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f"Training Epoch {epoch+1}")):
             # Move data to device
             images = batch['images'].to(device)
             boxes = batch['boxes']
@@ -965,19 +1145,24 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
             epoch_loss += loss.item()
             batch_count += 1
             
-            # Print batch progress
-            if (batch_idx + 1) % 20 == 0 or batch_idx + 1 == len(train_loader):
+            # Print batch progress for every 20 batches
+            if (batch_idx + 1) % 20 == 0:
                 print(f"  Batch {batch_idx+1}/{len(train_loader)} - Loss: {loss.item():.4f}")
         
-        # Update learning rate schedulers
+        # Update learning rate schedulers based on current phase
         if epoch < warmup_epochs:
-            # During warmup phase, use only warmup scheduler
+            # During warmup phase
             warmup_scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
             print(f"  Warmup phase: learning rate set to {current_lr:.6f}")
+        elif epoch < warmup_epochs + plateau_epochs:
+            # During plateau phase
+            plateau_scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"  Plateau phase: learning rate set to {current_lr:.6f}")
         else:
-            # After warmup, use cosine annealing scheduler
-            lr_scheduler.step()  # Using lr_scheduler from function argument
+            # During cosine annealing phase
+            cosine_scheduler.step()
             current_lr = optimizer.param_groups[0]['lr']
             print(f"  Cosine phase: learning rate set to {current_lr:.6f}")
 
@@ -985,8 +1170,8 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
         avg_train_loss = epoch_loss / max(1, batch_count)
         train_losses.append(avg_train_loss)
 
-        # Validation phase (only every few epochs)
-        val_epoch = (epoch + 1) % 2 == 0 or epoch < 2 or epoch >= epochs - 3
+        # Validation phase (only every few epochs to save time)
+        val_epoch = (epoch + 1) % 5 == 0 or epoch < 2 or epoch >= epochs - 5 or epoch == warmup_epochs - 1
         
         if val_epoch:
             # Validation phase for loss calculation
@@ -994,17 +1179,9 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
             val_loss = 0
             val_batch_count = 0
             
-            # Create a validation loader with no multiprocessing
-            safe_val_loader = DataLoader(
-                val_dataset,
-                batch_size=4,
-                shuffle=False, 
-                num_workers=0,  # No multiprocessing
-                collate_fn=custom_collate_fn
-            )
-            
+            print("Running validation...")
             with torch.no_grad():
-                for batch_idx, batch in enumerate(safe_val_loader):
+                for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validation")):
                     # Move data to device
                     images = batch['images'].to(device)
                     boxes = batch['boxes']
@@ -1026,17 +1203,15 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
                     # Track metrics
                     val_loss += loss.item()
                     val_batch_count += 1
-                    
-                    # Limit validation to speed up training
-                    if batch_idx >= 25:  # Check ~100 validation images
-                        break
             
             # Calculate average validation loss
             avg_val_loss = val_loss / max(1, val_batch_count)
             val_losses.append(avg_val_loss)
             
-            # Update main learning rate scheduler based on validation loss
-            lr_scheduler.step(avg_val_loss)
+            # Calculate mAP on validation set
+            print("Calculating mAP...")
+            val_map = calculate_mAP(model, val_loader, device)
+            val_maps.append(val_map)
             
             # Print epoch summary
             t_end = datetime.now()
@@ -1044,30 +1219,33 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
             print(f"  Epoch {epoch+1} completed in {duration}")
             print(f"  Train Loss: {avg_train_loss:.4f}")
             print(f"  Val Loss: {avg_val_loss:.4f}")
+            print(f"  Val mAP@0.5: {val_map:.4f}")
             
-            # Save checkpoint if this is the best model so far
-            if avg_val_loss < best_val_loss:
-                best_val_loss = avg_val_loss
+            # Save checkpoint if this is the best model so far (based on mAP)
+            if val_map > best_val_map:
+                best_val_map = val_map
                 patience_counter = 0
                 
-                print(f"  Saving best model with validation loss: {best_val_loss:.4f}")
+                print(f"  Saving best model with validation mAP: {best_val_map:.4f}")
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'val_loss': avg_val_loss,
+                    'val_map': val_map,
                 }, os.path.join(checkpoint_dir, 'best_model.pth'))
             else:
                 patience_counter += 1
-                print(f"  No improvement in validation loss for {patience_counter} epochs")
+                print(f"  No improvement in validation mAP for {patience_counter} validation runs")
                 
                 # Save periodic checkpoint
-                if (epoch + 1) % 5 == 0:
+                if (epoch + 1) % 20 == 0:
                     torch.save({
                         'epoch': epoch,
                         'model_state_dict': model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'val_loss': avg_val_loss,
+                        'val_map': val_map,
                     }, os.path.join(checkpoint_dir, f'checkpoint_epoch_{epoch+1}.pth'))
             
             # Early stopping check
@@ -1086,30 +1264,46 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, lr_scheduler,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'val_loss': val_losses[-1] if val_losses else float('inf'),
+        'val_map': val_maps[-1] if val_maps else 0.0,
     }, os.path.join(checkpoint_dir, 'final_model.pth'))
     
     # Return training history
     return {
         'train_losses': train_losses,
-        'val_losses': val_losses
+        'val_losses': val_losses,
+        'val_maps': val_maps
     }
 
-# Function to plot training history
+# Function to plot training history with mAP
 def plot_training_history(history):
-    """Plot training and validation metrics without mAP"""
-    plt.figure(figsize=(10, 6))
+    """Plot training and validation metrics including mAP"""
+    plt.figure(figsize=(15, 10))
     
     # Plot training and validation losses
+    plt.subplot(2, 1, 1)
     plt.plot(history['train_losses'], label='Training Loss')
-    plt.plot(history['val_losses'], label='Validation Loss')
+    
+    # Plot validation metrics only for epochs where validation was performed
+    val_epochs = np.linspace(0, len(history['train_losses'])-1, len(history['val_losses']))
+    plt.plot(val_epochs, history['val_losses'], label='Validation Loss')
+    
     plt.title('Training and Validation Losses')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
     plt.grid(True)
     
+    # Plot validation mAP
+    plt.subplot(2, 1, 2)
+    plt.plot(val_epochs, history['val_maps'], label='Validation mAP@0.5', color='g')
+    plt.title('Validation mAP')
+    plt.xlabel('Epoch')
+    plt.ylabel('mAP')
+    plt.legend()
+    plt.grid(True)
+    
     plt.tight_layout()
-    plt.savefig('training_history.png')
+    plt.savefig('training_history_with_map.png')
     plt.show()
 
 # Function to visualize detections
@@ -1137,7 +1331,7 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
     else:
         # Default transform
         transform = A.Compose([
-            A.Resize(height=300, width=300),
+            A.Resize(height=512, width=512),  # Increased from 300x300 to 512x512
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2()
         ])
@@ -1196,14 +1390,14 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
         # Scale box coordinates to original image size
         h, w, _ = orig_image.shape
         x1, y1, x2, y2 = box
-        x1 = int(x1 * w)
-        y1 = int(y1 * h)
-        x2 = int(x2 * w)
-        y2 = int(y2 * h)
+        x1 = max(0, int(x1 * w))
+        y1 = max(0, int(y1 * h))
+        x2 = min(w, int(x2 * w))
+        y2 = min(h, int(y2 * h))
         
         # Create rectangle patch
         rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, 
-                                edgecolor='r', facecolor='none')
+                               edgecolor='r', facecolor='none')
         plt.gca().add_patch(rect)
         
         # Add label
@@ -1214,24 +1408,26 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
     
     plt.title('Object Detections')
     plt.axis('off')
-    plt.savefig('detections.png')
+    plt.savefig('improved_detections.png')
     plt.show()
 
-# Updated main training function call
-print("Starting model training...")
+# Main training function call
+print("Starting improved SSD model training...")
 history = train_model(
     model=model,
     loss_fn=SSDLoss,
     optimizer=optimizer,
     warmup_scheduler=warmup_scheduler,
-    lr_scheduler=cosine_scheduler,
+    plateau_scheduler=plateau_scheduler,
+    cosine_scheduler=cosine_scheduler,
     train_loader=train_loader,
-    val_dataset=val_dataset, 
-    epochs=100,
-    warmup_epochs=5
+    val_loader=val_loader,
+    epochs=150,
+    warmup_epochs=5,
+    plateau_epochs=95
 )
 
-# Plot training history
+# Plot training history including mAP
 plot_training_history(history)
 
 # Load the best model
@@ -1239,16 +1435,21 @@ best_model_path = os.path.join('checkpoints', 'best_model.pth')
 if os.path.exists(best_model_path):
     checkpoint = torch.load(best_model_path)
     model.load_state_dict(checkpoint['model_state_dict'])
-    print(f"Loaded best model with validation loss: {checkpoint['val_loss']:.4f}")
+    print(f"Loaded best model with validation mAP: {checkpoint['val_map']:.4f}")
 else:
     print("No best model checkpoint found. Using final trained model.")
 
+# Evaluate on test set
+test_map = calculate_mAP(model, test_loader, device)
+print(f"Test set mAP@0.5: {test_map:.4f}")
+
 # Save the final model in a format suitable for inference
-final_model_path = 'ssd_pascal_voc_final.pth'
+final_model_path = 'improved_ssd_pascal_voc_final.pth'
 torch.save({
     'model_state_dict': model.state_dict(),
     'num_classes': num_classes,
-    'class_names': VOC_CLASSES
+    'class_names': VOC_CLASSES,
+    'test_map': test_map
 }, final_model_path)
 
 print(f"Final model saved to {final_model_path}")
