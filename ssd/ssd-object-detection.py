@@ -320,59 +320,113 @@ test_loader = DataLoader(
     pin_memory=True
 )
 
-# Define SSD model
+# Define FPN module for feature pyramid
+class FPN(nn.Module):
+    def __init__(self, in_channels_list, out_channels):
+        super(FPN, self).__init__()
+        
+        # Lateral connections (1x1 convolutions for channel reduction)
+        self.lateral_convs = nn.ModuleList([
+            nn.Conv2d(in_channels, out_channels, kernel_size=1)
+            for in_channels in in_channels_list
+        ])
+        
+        # Output convolutions
+        self.output_convs = nn.ModuleList([
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+            for _ in in_channels_list
+        ])
+    
+    def forward(self, features):
+        """
+        Forward function for FPN
+        
+        Args:
+            features: List of feature maps [P3, P4, P5, P6, P7]
+            
+        Returns:
+            List of output feature maps with same resolution but unified channels
+        """
+        results = []
+        # Last feature map doesn't need upsampling
+        last_inner = self.lateral_convs[-1](features[-1])
+        results.append(self.output_convs[-1](last_inner))
+        
+        # Process other feature maps from bottom up
+        for idx in range(len(features) - 2, -1, -1):
+            # Inner features - lateral connection + upsampled features
+            higher_res_features = self.lateral_convs[idx](features[idx])
+            
+            # Upsample previous results
+            inner_top_down = nn.functional.interpolate(
+                last_inner, size=higher_res_features.shape[-2:], 
+                mode='nearest'
+            )
+            
+            # Add features
+            last_inner = higher_res_features + inner_top_down
+            results.insert(0, self.output_convs[idx](last_inner))
+            
+        return results
+
+# Define SSD model with EfficientNet backbone and FPN
 class SSD(nn.Module):
     def __init__(self, num_classes):
         super(SSD, self).__init__()
         # Store num_classes as a class attribute
         self.num_classes = num_classes
         
-        # Load VGG16 with pretrained weights
-        vgg = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
-        features = list(vgg.features.children())
-
-        # First feature map (37x37)
-        self.conv1 = nn.Sequential(*features[:23])  # All VGG layers up to conv4_3
-
-        # Second feature map (18x18)
-        self.conv2 = nn.Sequential(*features[23:30])  # Conv5 blocks
-
-        # Additional convolution layers (18x18) - FC layers converted to Conv
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(512, 1024, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(1024, 1024, kernel_size=1),
-            nn.ReLU(inplace=True),
-        )
-
-        # (9x9)
-        self.conv4 = nn.Sequential(
-            nn.Conv2d(1024, 256, kernel_size=1),
+        # Load EfficientNet-B1 with pretrained weights
+        # Use pretrained ImageNet weights
+        self.backbone = torchvision.models.efficientnet_b1(weights=torchvision.models.EfficientNet_B1_Weights.IMAGENET1K_V1)
+        
+        # Get the feature maps we need from EfficientNet-B1
+        # Extract intermediate feature maps from EfficientNet
+        self.feature_extractors = nn.ModuleList([
+            # Extract first 2 blocks (P2)
+            nn.Sequential(*list(self.backbone.features)[:2]),
+            # Extract middle blocks (P3)
+            nn.Sequential(*list(self.backbone.features)[2:3]),
+            # Extract later blocks (P4)
+            nn.Sequential(*list(self.backbone.features)[3:5]),
+            # Extract deep features (P5)
+            nn.Sequential(*list(self.backbone.features)[5:7]),
+            # Extract deepest features (P6)
+            nn.Sequential(*list(self.backbone.features)[7:])
+        ])
+        
+        # Extract channel dimensions from EfficientNet blocks
+        # EfficientNet-B1 feature dimensions: [32, 24, 40, 80, 112, 192, 320]
+        self.feature_channels = [24, 40, 80, 192, 320]
+        
+        # Additional layers for deeper feature maps
+        self.extra_layer1 = nn.Sequential(
+            nn.Conv2d(320, 256, kernel_size=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 512, kernel_size=3, padding=1, stride=2),
             nn.ReLU(inplace=True),
         )
 
-        # (5x5)
-        self.conv5 = nn.Sequential(
+        self.extra_layer2 = nn.Sequential(
             nn.Conv2d(512, 128, kernel_size=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
             nn.ReLU(inplace=True),
         )
 
-        # (2x2)
-        self.conv6 = nn.Sequential(
-            nn.Conv2d(256, 128, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, padding=0, stride=2),  # No padding to get 2x2
-            nn.ReLU(inplace=True),
+        # Add FPN for feature fusion
+        self.fpn = FPN(
+            in_channels_list=[self.feature_channels[1], self.feature_channels[2], 
+                            self.feature_channels[4], 512, 256],
+            out_channels=256
         )
-
-        # Define actual feature map sizes based on the network architecture
-        self.feature_maps = [37, 18, 18, 9, 5, 2]  # Updated to match actual sizes
-        self.steps = [8, 16, 16, 32, 64, 100]  # effective stride for each feature map
-        self.scales = [0.1, 0.2, 0.37, 0.54, 0.71, 0.88, 1.05]  # anchor box scales
+        
+        # Define feature map sizes based on input size 512x512
+        # These will be different due to EfficientNet architecture compared to VGG
+        # These sizes are approximate for 512x512 input
+        self.feature_maps = [64, 32, 16, 8, 4, 2]
+        self.steps = [8, 16, 32, 64, 128, 256]  # effective stride for each feature map
+        self.scales = [0.07, 0.15, 0.33, 0.51, 0.69, 0.87, 1.05]  # anchor box scales
         self.aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]  # aspect ratios for each feature map
         
         # Calculate number of boxes per feature map cell
@@ -383,22 +437,22 @@ class SSD(nn.Module):
         
         # Define location layers with
         self.loc_layers = nn.ModuleList([
-            nn.Conv2d(512, self.num_anchors[0] * 4, kernel_size=3, padding=1),  # For conv1
-            nn.Conv2d(512, self.num_anchors[1] * 4, kernel_size=3, padding=1),  # For conv2
-            nn.Conv2d(1024, self.num_anchors[2] * 4, kernel_size=3, padding=1),  # For conv3
-            nn.Conv2d(512, self.num_anchors[3] * 4, kernel_size=3, padding=1),  # For conv4
-            nn.Conv2d(256, self.num_anchors[4] * 4, kernel_size=3, padding=1),  # For conv5
-            nn.Conv2d(256, self.num_anchors[5] * 4, kernel_size=3, padding=1)   # For conv6
+            nn.Conv2d(256, self.num_anchors[0] * 4, kernel_size=3, padding=1),  # For first feature map
+            nn.Conv2d(256, self.num_anchors[1] * 4, kernel_size=3, padding=1),  # For second feature map
+            nn.Conv2d(256, self.num_anchors[2] * 4, kernel_size=3, padding=1),  # For third feature map
+            nn.Conv2d(256, self.num_anchors[3] * 4, kernel_size=3, padding=1),  # For fourth feature map
+            nn.Conv2d(256, self.num_anchors[4] * 4, kernel_size=3, padding=1),  # For fifth feature map
+            nn.Conv2d(256, self.num_anchors[5] * 4, kernel_size=3, padding=1)   # For sixth feature map
         ])
 
         # Define confidence layers
         self.conf_layers = nn.ModuleList([
-            nn.Conv2d(512, self.num_anchors[0] * num_classes, kernel_size=3, padding=1),  # For conv1
-            nn.Conv2d(512, self.num_anchors[1] * num_classes, kernel_size=3, padding=1),  # For conv2
-            nn.Conv2d(1024, self.num_anchors[2] * num_classes, kernel_size=3, padding=1),  # For conv3
-            nn.Conv2d(512, self.num_anchors[3] * num_classes, kernel_size=3, padding=1),  # For conv4
-            nn.Conv2d(256, self.num_anchors[4] * num_classes, kernel_size=3, padding=1),  # For conv5
-            nn.Conv2d(256, self.num_anchors[5] * num_classes, kernel_size=3, padding=1)   # For conv6
+            nn.Conv2d(256, self.num_anchors[0] * num_classes, kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[1] * num_classes, kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[2] * num_classes, kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[3] * num_classes, kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[4] * num_classes, kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[5] * num_classes, kernel_size=3, padding=1)
         ])
         
         # Generate default boxes
@@ -452,35 +506,32 @@ class SSD(nn.Module):
 
     # Forward function
     def forward(self, x):
-        # Extract feature maps
-        sources = []
+        # Extract features from EfficientNet backbone
+        features = []
+        for extractor in self.feature_extractors:
+            x = extractor(x)
+            features.append(x)
         
-        # Apply VGG layers and extract feature maps
-        x = self.conv1(x)
-        sources.append(x)  # 37x37 feature map
+        # Get P3, P4, P5
+        selected_features = [features[1], features[2], features[4]]
         
-        x = self.conv2(x)
-        sources.append(x)  # 18x18 feature map
+        # Add extra layers for P6, P7
+        p6 = self.extra_layer1(features[4])
+        p7 = self.extra_layer2(p6)
         
-        x = self.conv3(x)
-        sources.append(x)  # 18x18 feature map (different channels)
+        # Combine to get all features for FPN
+        fpn_input = [selected_features[0], selected_features[1], selected_features[2], p6, p7]
         
-        x = self.conv4(x)
-        sources.append(x)  # 9x9 feature map
+        # Apply FPN to get unified feature maps
+        fpn_features = self.fpn(fpn_input)
         
-        x = self.conv5(x)
-        sources.append(x)  # 5x5 feature map
-        
-        x = self.conv6(x)
-        sources.append(x)  # 2x2 feature map
-
         # Apply prediction layers
         loc_preds = []
         conf_preds = []
         
-        for i, (source, loc_layer, conf_layer) in enumerate(zip(sources, self.loc_layers, self.conf_layers)):
+        for i, (feature, loc_layer, conf_layer) in enumerate(zip(fpn_features, self.loc_layers, self.conf_layers)):
             # Get location predictions
-            loc = loc_layer(source)
+            loc = loc_layer(feature)
             batch_size = loc.size(0)
             # Reshape to [batch_size, height, width, num_anchors * 4] then flatten to [batch_size, num_anchors_total, 4]
             loc = loc.permute(0, 2, 3, 1).contiguous()
@@ -488,7 +539,7 @@ class SSD(nn.Module):
             loc_preds.append(loc)
             
             # Get confidence predictions
-            conf = conf_layer(source)
+            conf = conf_layer(feature)
             # Reshape to [batch_size, height, width, num_anchors * num_classes] then flatten
             conf = conf.permute(0, 2, 3, 1).contiguous()
             conf = conf.view(batch_size, -1, self.num_classes)
