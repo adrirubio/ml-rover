@@ -551,6 +551,47 @@ class SSD(nn.Module):
         
         return loc_preds, conf_preds, self.default_boxes_xyxy
 
+# Improved loss function with GIoU
+def giou_loss(pred_boxes, target_boxes, eps=1e-7):
+    """
+    Calculates the Generalized IoU loss
+    
+    Args:
+        pred_boxes: (tensor) Predicted boxes, sized [N, 4]
+        target_boxes: (tensor) Target boxes, sized [N, 4]
+        
+    Returns:
+        GIoU loss value
+    """
+    # Calculate intersection area
+    inter_min = torch.max(pred_boxes[:, :2], target_boxes[:, :2])
+    inter_max = torch.min(pred_boxes[:, 2:], target_boxes[:, 2:])
+    inter_wh = torch.clamp(inter_max - inter_min, min=0)
+    inter = inter_wh[:, 0] * inter_wh[:, 1]
+    
+    # Calculate union area
+    pred_area = (pred_boxes[:, 2] - pred_boxes[:, 0]) * (pred_boxes[:, 3] - pred_boxes[:, 1])
+    target_area = (target_boxes[:, 2] - target_boxes[:, 0]) * (target_boxes[:, 3] - target_boxes[:, 1])
+    union = pred_area + target_area - inter
+    
+    # Calculate IoU
+    iou = inter / (union + eps)
+    
+    # Calculate smallest enclosing box
+    encl_min = torch.min(pred_boxes[:, :2], target_boxes[:, :2])
+    encl_max = torch.max(pred_boxes[:, 2:], target_boxes[:, 2:])
+    encl_wh = torch.max(encl_max - encl_min, torch.zeros_like(encl_max))
+    encl_area = encl_wh[:, 0] * encl_wh[:, 1]
+    
+    # Calculate GIoU
+    giou = iou - (encl_area - union) / (encl_area + eps)
+    
+    # GIoU Loss (1 - GIoU)
+    loss = 1 - giou
+    
+    return loss
+
+# Helper functions for box encoding/decoding
 def box_iou(boxes1, boxes2):
     """
     Compute Intersection over Union (IoU) between two sets of boxes.
@@ -610,17 +651,18 @@ def encode_boxes(matched_boxes, default_boxes):
     
     return encoded_boxes
 
+# Improved SSD loss with GIoU
 class SSD_loss(nn.Module):
-    def __init__(self, num_classes, default_boxes, device, alpha=0.25, gamma=2.0):
+    def __init__(self, num_classes, default_boxes, device, alpha=0.5, gamma=1.5):
         """
-        SSD Loss function with Focal Loss
+        Improved SSD Loss function with GIoU and Focal Loss
 
         Args:
             num_classes (int): Number of object classes
             default_boxes (torch.Tensor): Default anchor boxes (in corner format)
             device (torch.device): GPU or CPU
             alpha (float): Weighting factor in focal loss
-            gamma (float): Focusing parameter in focal loss (higher means more focus on hard examples)
+            gamma (float): Focusing parameter in focal loss
         """
         super(SSD_loss, self).__init__()
         
@@ -635,7 +677,6 @@ class SSD_loss(nn.Module):
         self.threshold = 0.5  # IoU threshold for positive matches
         self.neg_pos_ratio = 3  # Ratio of negative to positive samples
         
-        self.smooth_l1 = nn.SmoothL1Loss(reduction='sum')
         self.cross_entropy = nn.CrossEntropyLoss(reduction='none')
     
     def focal_loss(self, pred, target):
@@ -666,7 +707,7 @@ class SSD_loss(nn.Module):
     
     def forward(self, predictions, targets):
         """
-        Compute SSD loss with focal loss for classification.
+        Compute SSD loss with GIoU for localization and focal loss for classification.
 
         Args:
             predictions (tuple): (loc_preds, conf_preds, default_boxes)
@@ -726,10 +767,20 @@ class SSD_loss(nn.Module):
         if num_pos == 0:
             return torch.tensor(0.0).to(self.device)
         
-        # Localization loss (only for positive matches)
+        # Localization loss with GIoU loss
+        # First, decode predicted boxes
         pos_idx = pos.unsqueeze(2).expand_as(loc_preds)
-        loc_loss = self.smooth_l1(loc_preds[pos_idx].view(-1, 4), 
-                                  loc_t[pos_idx].view(-1, 4))
+        
+        # Get positive predictions and targets
+        pos_loc_preds = loc_preds[pos_idx].view(-1, 4)
+        pos_loc_targets = loc_t[pos_idx].view(-1, 4)
+        
+        # Decode predictions to get actual boxes
+        decoded_boxes = decode_boxes(pos_loc_preds, self.default_boxes.repeat(batch_size, 1, 1)[pos_idx].view(-1, 4))
+        decoded_targets = decode_boxes(pos_loc_targets, self.default_boxes.repeat(batch_size, 1, 1)[pos_idx].view(-1, 4))
+        
+        # Compute GIoU loss
+        loc_loss = giou_loss(decoded_boxes, decoded_targets).mean()
         
         # Confidence loss with focal loss
         # Reshape confidence predictions to [batch_size * num_priors, num_classes]
@@ -744,10 +795,9 @@ class SSD_loss(nn.Module):
         
         # Normalize by number of positive examples
         pos_count = max(1, num_pos)  # Avoid division by zero
-        loc_loss /= pos_count
         conf_loss /= pos_count
         
-        # Return scalar total loss
+        # Return scalar total loss - balance localization and classification loss
         total_loss = loc_loss + conf_loss
         return total_loss
 
