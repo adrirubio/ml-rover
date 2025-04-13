@@ -4,5 +4,5 @@
 - Base Network: EfficientNet-B1
 - Input Resolution: 512x512
 - Feature Maps: 6 scales for multi-scale detection
-- Default Boxes: ~8000 per image
+- Default Boxes: ~24000 per image
 - Output: Class scores and box offsets for each default box
