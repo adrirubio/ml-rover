@@ -1,6 +1,6 @@
 # SSD Arquitecture
 
-- Model: SSD300
+- Model: SSD512
 - Base Network: EfficientNet-B1
 - Input Resolution: 512x512
 - Feature Maps: 6 scales for multi-scale detection
