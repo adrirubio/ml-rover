@@ -20,6 +20,7 @@ from PIL import Image
 from tqdm import tqdm
 from collections import defaultdict
 from torchvision.ops.boxes import box_convert, box_iou
+import cv2
 
 # Set seeds for reproducibility
 torch.manual_seed(42)
@@ -121,7 +122,7 @@ class PascalVOCDataset(Dataset):
     
     def _load_mosaic(self, index):
         """
-        Loads 4 images and combines them in a mosaic pattern
+        Loads 4 images and combines them in a mosaic pattern with improved box handling
         """
         # Get 3 more random indexes
         indices = [index] + [random.randint(0, len(self.ids) - 1) for _ in range(3)]
@@ -166,61 +167,38 @@ class PascalVOCDataset(Dataset):
                 boxes_scaled[:, 2] = w_scale * boxes[:, 2] + x1a
                 boxes_scaled[:, 3] = h_scale * boxes[:, 3] + y1a
                 
-                # Add boxes and labels
-                mosaic_boxes.extend(boxes_scaled)
-                mosaic_labels.extend(labels)
+                # Process each box and filter those with minimal overlap
+                for box_idx, (box, label) in enumerate(zip(boxes_scaled, labels)):
+                    # Calculate original box area
+                    box_width = box[2] - box[0]
+                    box_height = box[3] - box[1]
+                    original_area = box_width * box_height
+                    
+                    # Clip box to image boundaries
+                    clipped_box = [
+                        max(0, box[0]),
+                        max(0, box[1]),
+                        min(img_size, box[2]),
+                        min(img_size, box[3])
+                    ]
+                    
+                    # Calculate clipped box area
+                    clipped_width = clipped_box[2] - clipped_box[0]
+                    clipped_height = clipped_box[3] - clipped_box[1]
+                    clipped_area = clipped_width * clipped_height
+                    
+                    # Only keep boxes that retain at least 25% of their original area after clipping
+                    # and have both width and height > 0
+                    if (clipped_width > 0 and clipped_height > 0 and 
+                        clipped_area / (original_area + 1e-8) > 0.25):
+                        mosaic_boxes.append(clipped_box)  # Add the clipped box
+                        mosaic_labels.append(label)
         
-        # Clip boxes to image boundaries
+        # Convert to numpy arrays if boxes exist
         if len(mosaic_boxes) > 0:
             mosaic_boxes = np.array(mosaic_boxes)
-            mosaic_boxes[:, 0] = np.clip(mosaic_boxes[:, 0], 0, img_size)
-            mosaic_boxes[:, 1] = np.clip(mosaic_boxes[:, 1], 0, img_size)
-            mosaic_boxes[:, 2] = np.clip(mosaic_boxes[:, 2], 0, img_size)
-            mosaic_boxes[:, 3] = np.clip(mosaic_boxes[:, 3], 0, img_size)
-            
-            # Filter out invalid boxes
-            valid_boxes = []
-            valid_labels = []
-            
-            for box, label in zip(mosaic_boxes, mosaic_labels):
-                if box[2] > box[0] and box[3] > box[1]:  # width and height > 0
-                    valid_boxes.append(box)
-                    valid_labels.append(label)
-            
-            mosaic_boxes = valid_boxes
-            mosaic_labels = valid_labels
         
         return mosaic_img, mosaic_boxes, mosaic_labels
-    
-    def _parse_voc_xml(self, node):
-        """Parse Pascal VOC annotation XML file"""
-        boxes = []
-        labels = []
-        
-        for obj in node.findall('object'):
-            name = obj.find('name').text
-            if name not in self.class_to_idx:
-                continue
-                
-            label = self.class_to_idx[name]
-            
-            bndbox = obj.find('bndbox')
-            xmin = float(bndbox.find('xmin').text)
-            ymin = float(bndbox.find('ymin').text)
-            xmax = float(bndbox.find('xmax').text)
-            ymax = float(bndbox.find('ymax').text)
-            
-            # Skip invalid boxes
-            if xmax <= xmin or ymax <= ymin or xmax <= 0 or ymax <= 0:
-                continue
-                
-            boxes.append([xmin, ymin, xmax, ymax])
-            labels.append(label)
-        
-        return boxes, labels
-
-# Import required for mosaic augmentation
-import cv2
 
 # Define enhanced transforms with resolution 512x512
 train_transforms = A.Compose([
@@ -295,7 +273,7 @@ test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test',
 # Create DataLoaders
 train_loader = DataLoader(
     train_dataset, 
-    batch_size=32,
+    batch_size=64,
     shuffle=True, 
     num_workers=4,
     collate_fn=custom_collate_fn,
@@ -304,7 +282,7 @@ train_loader = DataLoader(
 
 val_loader = DataLoader(
     val_dataset, 
-    batch_size=32, 
+    batch_size=64, 
     shuffle=False, 
     num_workers=4,
     collate_fn=custom_collate_fn,
@@ -313,7 +291,7 @@ val_loader = DataLoader(
 
 test_loader = DataLoader(
     test_dataset, 
-    batch_size=32, 
+    batch_size=64, 
     shuffle=False, 
     num_workers=4,
     collate_fn=custom_collate_fn,
@@ -833,8 +811,8 @@ def decode_boxes(loc, default_boxes):
     
     return boxes
 
-# Instantiate the SSD model with COCO weights and send it to the GPU
-model = SSD(num_classes=num_classes, use_coco_weights=True)
+# Instantiate the SSD model
+model = SSD(num_classes=num_classes)
 model.to(device)
 
 # Initialize the SSD loss function
@@ -851,15 +829,15 @@ for i in range(2):  # Freeze first 2 feature extractors
 
 # Define optimizer with SGD and momentum
 optimizer = optim.SGD([
-    {'params': model.feature_extractors[2].parameters(), 'lr': 0.001},  # Medium feature extractor
-    {'params': model.feature_extractors[3].parameters(), 'lr': 0.001},  # Higher feature extractor
-    {'params': model.feature_extractors[4].parameters(), 'lr': 0.001},  # Highest feature extractor
-    {'params': model.extra_layer1.parameters(), 'lr': 0.002},
-    {'params': model.extra_layer2.parameters(), 'lr': 0.002},
-    {'params': model.fpn.parameters(), 'lr': 0.002},
-    {'params': model.loc_layers.parameters(), 'lr': 0.002},
-    {'params': model.conf_layers.parameters(), 'lr': 0.002}
-], lr=0.001, momentum=0.9, weight_decay=4e-5)
+    {'params': model.feature_extractors[2].parameters(), 'lr': 0.00141},  
+    {'params': model.feature_extractors[3].parameters(), 'lr': 0.00141},  
+    {'params': model.feature_extractors[4].parameters(), 'lr': 0.00141},  
+    {'params': model.extra_layer1.parameters(), 'lr': 0.00283},          
+    {'params': model.extra_layer2.parameters(), 'lr': 0.00283},          
+    {'params': model.fpn.parameters(), 'lr': 0.00283},                   
+    {'params': model.loc_layers.parameters(), 'lr': 0.00283},            
+    {'params': model.conf_layers.parameters(), 'lr': 0.00283}            
+], lr=0.00141, momentum=0.9, weight_decay=4e-5)
 
 # Three-phase learning rate scheduler
 def get_three_phase_scheduler(optimizer, warmup_epochs=5, plateau_epochs=95, max_epochs=150):
