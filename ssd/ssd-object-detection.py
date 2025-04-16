@@ -199,6 +199,33 @@ class PascalVOCDataset(Dataset):
             mosaic_boxes = np.array(mosaic_boxes)
         
         return mosaic_img, mosaic_boxes, mosaic_labels
+    
+    def _parse_voc_xml(self, node):
+        """Parse Pascal VOC annotation XML file"""
+        boxes = []
+        labels = []
+        
+        for obj in node.findall('object'):
+            name = obj.find('name').text
+            if name not in self.class_to_idx:
+                continue
+                
+            label = self.class_to_idx[name]
+            
+            bndbox = obj.find('bndbox')
+            xmin = float(bndbox.find('xmin').text)
+            ymin = float(bndbox.find('ymin').text)
+            xmax = float(bndbox.find('xmax').text)
+            ymax = float(bndbox.find('ymax').text)
+            
+            # Skip invalid boxes
+            if xmax <= xmin or ymax <= ymin or xmax <= 0 or ymax <= 0:
+                continue
+                
+            boxes.append([xmin, ymin, xmax, ymax])
+            labels.append(label)
+        
+        return boxes, labels
 
 # Define enhanced transforms with resolution 512x512
 train_transforms = A.Compose([
