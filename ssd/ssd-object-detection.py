@@ -5,8 +5,6 @@ from torch.utils.data import DataLoader, Dataset
 from torch.cuda.amp import autocast, GradScaler
 import torch.optim as optim
 import torchvision
-import torchvision.transforms as transforms
-import torchvision.datasets as datasets
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import numpy as np
@@ -19,7 +17,8 @@ import xml.etree.ElementTree as ET
 from PIL import Image
 from tqdm import tqdm
 from collections import defaultdict
-from torchvision.ops.boxes import box_convert, box_iou
+from torchvision.ops.boxes import box_iou
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 import cv2
 
 # Set seeds for reproducibility
@@ -40,232 +39,144 @@ VOC_CLASSES = (
     'motorbike', 'person', 'pottedplant',
     'sheep', 'sofa', 'train', 'tvmonitor'
 )
-
 num_classes = len(VOC_CLASSES)
 print(f"Number of classes: {num_classes}")
 
 # Define Pascal VOC Dataset with improved capabilities
 class PascalVOCDataset(Dataset):
     def __init__(self, root, year='2007', image_set='train', transforms=None, use_mosaic=False, mosaic_prob=0.5):
-        """
-        Pascal VOC Dataset with enhanced augmentation
-        
-        Args:
-            root (str): Path to VOCdevkit folder
-            year (str): Dataset year ('2007' or '2012')
-            image_set (str): Dataset type ('train', 'val', 'test')
-            transforms (callable): Transforms to be applied
-            use_mosaic (bool): Whether to use mosaic augmentation
-            mosaic_prob (float): Probability of applying mosaic augmentation
-        """
         self.root = root
         self.year = year
         self.image_set = image_set
         self.transforms = transforms
-        self.use_mosaic = use_mosaic and image_set == 'train'  # Only use mosaic for training
+        self.use_mosaic = use_mosaic and image_set == 'train'
         self.mosaic_prob = mosaic_prob
         
-        # Paths
         self.images_dir = os.path.join(root, f'VOC{year}', 'JPEGImages')
         self.annotations_dir = os.path.join(root, f'VOC{year}', 'Annotations')
         
-        # Load image ids
         splits_dir = os.path.join(root, f'VOC{year}', 'ImageSets', 'Main')
         split_file = os.path.join(splits_dir, f'{image_set}.txt')
-        
         with open(split_file, 'r') as f:
             self.ids = [x.strip() for x in f.readlines()]
-        
-        # Create class to index mapping
+            
         self.class_to_idx = {cls: i for i, cls in enumerate(VOC_CLASSES)}
     
     def __len__(self):
         return len(self.ids)
     
     def load_image_and_labels(self, index):
-        """Load image and annotations for a given index"""
         img_id = self.ids[index]
-        
-        # Load image
         img_path = os.path.join(self.images_dir, f'{img_id}.jpg')
         img = Image.open(img_path).convert('RGB')
         img = np.array(img)
-        
-        # Load annotation
         anno_path = os.path.join(self.annotations_dir, f'{img_id}.xml')
         boxes, labels = self._parse_voc_xml(ET.parse(anno_path).getroot())
-        
         return img, boxes, labels
     
     def __getitem__(self, index):
-        # Decide whether to use mosaic
         if self.use_mosaic and random.random() < self.mosaic_prob:
             img, boxes, labels = self._load_mosaic(index)
         else:
             img, boxes, labels = self.load_image_and_labels(index)
-        
-        sample = {
-            'image': img,
-            'bboxes': boxes,
-            'labels': labels
-        }
-        
-        # Apply transformations
+        sample = {'image': img, 'bboxes': boxes, 'labels': labels}
         if self.transforms:
             sample = self.transforms(**sample)
-            
+        
+        # Normalize bounding boxes assuming the image is resized to 512x512
+        normalized_boxes = []
+        for box in sample['bboxes']:
+            xmin, ymin, xmax, ymax = box
+            nbox = [xmin / 512, ymin / 512, xmax / 512, ymax / 512]
+            normalized_boxes.append(nbox)
+        if normalized_boxes:
+            arr = np.array(normalized_boxes)
+            if arr.min() < 0 or arr.max() > 1:
+                print(f"WARNING: Normalized boxes out of bounds: min={arr.min()}, max={arr.max()}")
+
         return {
             'images': sample['image'],
-            'boxes': torch.FloatTensor(sample['bboxes']) if len(sample['bboxes']) > 0 else torch.zeros((0, 4)),
-            'labels': torch.LongTensor(sample['labels']) if len(sample['labels']) > 0 else torch.zeros(0, dtype=torch.long)
+            'boxes': torch.FloatTensor(normalized_boxes) if normalized_boxes else torch.zeros((0, 4)),
+            'labels': torch.LongTensor(sample['labels']) if sample['labels'] else torch.zeros(0, dtype=torch.long)
         }
     
     def _load_mosaic(self, index):
-        """
-        Loads 4 images and combines them in a mosaic pattern with improved box handling
-        """
-        # Get 3 more random indexes
         indices = [index] + [random.randint(0, len(self.ids) - 1) for _ in range(3)]
-        
-        # Final image will be 2x the size before resizing
-        img_size = 1024  # This will later be resized to target size
-        
-        # Center of the mosaic
+        img_size = 1024
         cx, cy = img_size // 2, img_size // 2
-        
-        # Initialize mosaic image and annotation lists
         mosaic_img = np.zeros((img_size, img_size, 3), dtype=np.uint8)
         mosaic_boxes = []
         mosaic_labels = []
-        
-        # Mosaic quadrants
         positions = [
-            [0, 0, cx, cy],          # top-left
-            [cx, 0, img_size, cy],   # top-right
-            [0, cy, cx, img_size],   # bottom-left
-            [cx, cy, img_size, img_size]  # bottom-right
+            [0, 0, cx, cy],
+            [cx, 0, img_size, cy],
+            [0, cy, cx, img_size],
+            [cx, cy, img_size, img_size]
         ]
-        
         for i, idx in enumerate(indices):
             img, boxes, labels = self.load_image_and_labels(idx)
             h, w = img.shape[:2]
-            
-            # Place image in mosaic
-            x1a, y1a, x2a, y2a = positions[i]  # mosaic position
-            
-            # Resize image to fit the quadrant
+            x1a, y1a, x2a, y2a = positions[i]
             h_scale, w_scale = (y2a - y1a) / h, (x2a - x1a) / w
             img_resized = cv2.resize(img, (x2a - x1a, y2a - y1a))
             mosaic_img[y1a:y2a, x1a:x2a] = img_resized
-            
-            # Adjust box coordinates
             if len(boxes) > 0:
-                # Scale box coordinates
+                if not isinstance(boxes, np.ndarray):
+                    boxes = np.array(boxes)
                 boxes_scaled = boxes.copy()
                 boxes_scaled[:, 0] = w_scale * boxes[:, 0] + x1a
                 boxes_scaled[:, 1] = h_scale * boxes[:, 1] + y1a
                 boxes_scaled[:, 2] = w_scale * boxes[:, 2] + x1a
                 boxes_scaled[:, 3] = h_scale * boxes[:, 3] + y1a
-                
-                # Process each box and filter those with minimal overlap
-                for box_idx, (box, label) in enumerate(zip(boxes_scaled, labels)):
-                    # Calculate original box area
+                for box, label in zip(boxes_scaled, labels):
                     box_width = box[2] - box[0]
                     box_height = box[3] - box[1]
                     original_area = box_width * box_height
-                    
-                    # Clip box to image boundaries
                     clipped_box = [
                         max(0, box[0]),
                         max(0, box[1]),
                         min(img_size, box[2]),
                         min(img_size, box[3])
                     ]
-                    
-                    # Calculate clipped box area
                     clipped_width = clipped_box[2] - clipped_box[0]
                     clipped_height = clipped_box[3] - clipped_box[1]
                     clipped_area = clipped_width * clipped_height
-                    
-                    # Only keep boxes that retain at least 25% of their original area after clipping
-                    # and have both width and height > 0
                     if (clipped_width > 0 and clipped_height > 0 and 
                         clipped_area / (original_area + 1e-8) > 0.25):
-                        mosaic_boxes.append(clipped_box)  # Add the clipped box
+                        mosaic_boxes.append(clipped_box)
                         mosaic_labels.append(label)
-        
-        # Convert to numpy arrays if boxes exist
         if len(mosaic_boxes) > 0:
             mosaic_boxes = np.array(mosaic_boxes)
-        
         return mosaic_img, mosaic_boxes, mosaic_labels
     
     def _parse_voc_xml(self, node):
-        """Parse Pascal VOC annotation XML file"""
         boxes = []
         labels = []
-        
         for obj in node.findall('object'):
             name = obj.find('name').text
             if name not in self.class_to_idx:
                 continue
-                
             label = self.class_to_idx[name]
-            
             bndbox = obj.find('bndbox')
             xmin = float(bndbox.find('xmin').text)
             ymin = float(bndbox.find('ymin').text)
             xmax = float(bndbox.find('xmax').text)
             ymax = float(bndbox.find('ymax').text)
-            
-            # Skip invalid boxes
             if xmax <= xmin or ymax <= ymin or xmax <= 0 or ymax <= 0:
                 continue
-                
             boxes.append([xmin, ymin, xmax, ymax])
             labels.append(label)
-        
         return boxes, labels
 
-# Define enhanced transforms with resolution 512x512
+# Define transforms with resolution 512x512
 train_transforms = A.Compose([
-    # Spatial transformations
     A.Resize(height=512, width=512),
-    
-    # Flips and rotations
     A.HorizontalFlip(p=0.5),
-    A.RandomRotate90(p=0.2),
     A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=15, p=0.3),
-    
-    # Color augmentations - enhanced
-    A.OneOf([
-        A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.15, p=1.0),
-        A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=1.0),
-        A.HueSaturationValue(hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, p=1.0),
-    ], p=0.7),
-    
-    # Noise and blur - more aggressive
-    A.OneOf([
-        A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
-        A.GaussianBlur(blur_limit=5, p=1.0),
-        A.MotionBlur(blur_limit=5, p=1.0),
-    ], p=0.3),
-    
-    # Weather simulation
-    A.OneOf([
-        A.RandomShadow(p=1.0),
-        A.RandomRain(drop_length=8, blur_value=3, p=1.0),
-        A.RandomFog(fog_coef_lower=0.1, fog_coef_upper=0.3, p=1.0),
-    ], p=0.2),
-    
-    # Cutout/erasing
-    A.CoarseDropout(max_holes=8, max_height=64, max_width=64, min_holes=1, 
-                   min_height=32, min_width=32, fill_value=0, p=0.2),
-    
-    # Normalize and convert to tensor
+    A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=0.3),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
-], bbox_params=A.BboxParams(format='pascal_voc', min_visibility=0.3, label_fields=['labels']))
+], bbox_params=A.BboxParams(format='pascal_voc', min_visibility=0.5, label_fields=['labels']))
 
 # Validation transformations
 val_transforms = A.Compose([
@@ -287,11 +198,11 @@ def custom_collate_fn(batch):
     }
 
 # Create datasets with mosaic augmentation
-voc_root = '/home/adrian/ml-rover/VOCdevkit/VOCdevkit'
+voc_root = '/home/adrian/ssd/VOCdevkit/VOCdevkit'
 
 # For 2007 dataset
 train_dataset = PascalVOCDataset(voc_root, year='2007', image_set='train', 
-                                transforms=train_transforms, use_mosaic=True, mosaic_prob=0.5)
+                                transforms=train_transforms, use_mosaic=True, mosaic_prob=0.7)
 val_dataset = PascalVOCDataset(voc_root, year='2007', image_set='val', 
                               transforms=val_transforms)
 test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test', 
@@ -300,7 +211,7 @@ test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test',
 # Create DataLoaders
 train_loader = DataLoader(
     train_dataset, 
-    batch_size=64,
+    batch_size=32,
     shuffle=True, 
     num_workers=4,
     collate_fn=custom_collate_fn,
@@ -309,7 +220,7 @@ train_loader = DataLoader(
 
 val_loader = DataLoader(
     val_dataset, 
-    batch_size=64, 
+    batch_size=32, 
     shuffle=False, 
     num_workers=4,
     collate_fn=custom_collate_fn,
@@ -318,7 +229,7 @@ val_loader = DataLoader(
 
 test_loader = DataLoader(
     test_dataset, 
-    batch_size=64, 
+    batch_size=32, 
     shuffle=False, 
     num_workers=4,
     collate_fn=custom_collate_fn,
@@ -388,25 +299,21 @@ class SSD(nn.Module):
         # Get the feature maps we need from EfficientNet-B1
         # Extract intermediate feature maps from EfficientNet
         self.feature_extractors = nn.ModuleList([
-            # Extract first 2 blocks (P2)
-            nn.Sequential(*list(self.backbone.features)[:2]),
-            # Extract middle blocks (P3)
-            nn.Sequential(*list(self.backbone.features)[2:3]),
-            # Extract later blocks (P4)
-            nn.Sequential(*list(self.backbone.features)[3:5]),
-            # Extract deep features (P5)
-            nn.Sequential(*list(self.backbone.features)[5:7]),
-            # Extract deepest features (P6)
-            nn.Sequential(*list(self.backbone.features)[7:])
+            nn.Sequential(*list(self.backbone.features)[:2]),    # Expected to output 24 channels
+            nn.Sequential(*list(self.backbone.features)[2:4]),     # Expected to output 40 channels
+            nn.Sequential(*list(self.backbone.features)[4:6]),     # Expected to output 80 channels
+            nn.Sequential(*list(self.backbone.features)[6:8]),     # Expected to output 192 channels
+            nn.Sequential(*list(self.backbone.features)[8:])       # Expected to output 1280 channels
         ])
+
         
         # Extract channel dimensions from EfficientNet blocks
-        # EfficientNet-B1 feature dimensions: [32, 24, 40, 80, 112, 192, 320]
-        self.feature_channels = [24, 40, 80, 192, 320]
+        # EfficientNet-B1 feature dimensions: [32, 24, 40, 112, 112, 192, 1280]
+        self.feature_channels = [24, 40, 112, 192, 1280]
         
         # Additional layers for deeper feature maps
         self.extra_layer1 = nn.Sequential(
-            nn.Conv2d(320, 256, kernel_size=1),
+            nn.Conv2d(1280, 256, kernel_size=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(256, 512, kernel_size=3, padding=1, stride=2),
             nn.ReLU(inplace=True),
@@ -429,10 +336,11 @@ class SSD(nn.Module):
         # Define feature map sizes based on input size 512x512
         # These will be different due to EfficientNet architecture compared to VGG
         # These sizes are approximate for 512x512 input
-        self.feature_maps = [64, 32, 16, 8, 4, 2]
-        self.steps = [8, 16, 32, 64, 128, 256]  # effective stride for each feature map
-        self.scales = [0.07, 0.15, 0.33, 0.51, 0.69, 0.87, 1.05]  # anchor box scales
-        self.aspect_ratios = [[2], [2, 3], [2, 3], [2, 3], [2], [2]]  # aspect ratios for each feature map
+        self.feature_maps = [64, 32, 16, 8, 4]
+        self.steps = [8, 16, 32, 64, 128]  
+        # Update scales for better anchor coverage
+        self.scales = [0.07, 0.15, 0.33, 0.51, 0.69, 0.87]
+        self.aspect_ratios = [[2, 3], [2, 3], [2, 3], [2, 3], [2, 3]]
         
         # Calculate number of boxes per feature map cell
         self.num_anchors = []
@@ -446,8 +354,7 @@ class SSD(nn.Module):
             nn.Conv2d(256, self.num_anchors[1] * 4, kernel_size=3, padding=1),  # For second feature map
             nn.Conv2d(256, self.num_anchors[2] * 4, kernel_size=3, padding=1),  # For third feature map
             nn.Conv2d(256, self.num_anchors[3] * 4, kernel_size=3, padding=1),  # For fourth feature map
-            nn.Conv2d(256, self.num_anchors[4] * 4, kernel_size=3, padding=1),  # For fifth feature map
-            nn.Conv2d(256, self.num_anchors[5] * 4, kernel_size=3, padding=1)   # For sixth feature map
+            nn.Conv2d(256, self.num_anchors[4] * 4, kernel_size=3, padding=1)  # For fifth feature map
         ])
 
         # Define confidence layers
@@ -456,8 +363,7 @@ class SSD(nn.Module):
             nn.Conv2d(256, self.num_anchors[1] * num_classes, kernel_size=3, padding=1),
             nn.Conv2d(256, self.num_anchors[2] * num_classes, kernel_size=3, padding=1),
             nn.Conv2d(256, self.num_anchors[3] * num_classes, kernel_size=3, padding=1),
-            nn.Conv2d(256, self.num_anchors[4] * num_classes, kernel_size=3, padding=1),
-            nn.Conv2d(256, self.num_anchors[5] * num_classes, kernel_size=3, padding=1)
+            nn.Conv2d(256, self.num_anchors[4] * num_classes, kernel_size=3, padding=1)
         ])
         
         # Generate default boxes
@@ -620,18 +526,10 @@ def box_iou(boxes1, boxes2):
     union = area1[:, None] + area2 - inter
     return inter / union
 
-def encode_boxes(matched_boxes, default_boxes):
+def encode_boxes(matched_boxes, default_boxes, variance=[0.1, 0.2]):
     """
-    Encode ground truth boxes relative to default boxes (anchor boxes).
-    
-    Args:
-        matched_boxes (torch.Tensor): Ground truth boxes (N, 4) in corner format
-        default_boxes (torch.Tensor): Default anchor boxes (N, 4) in corner format
-    
-    Returns:
-        torch.Tensor: Encoded box locations (as used in the SSD paper)
+    Encode ground truth boxes relative to default boxes with variance scaling.
     """
-    # Convert from corner to center format
     def corner_to_center(boxes):
         width = boxes[:, 2] - boxes[:, 0]
         height = boxes[:, 3] - boxes[:, 1]
@@ -639,204 +537,201 @@ def encode_boxes(matched_boxes, default_boxes):
         cy = boxes[:, 1] + height / 2
         return torch.stack([cx, cy, width, height], dim=1)
     
-    # Get centers, widths and heights
     g_boxes = corner_to_center(matched_boxes)
     d_boxes = corner_to_center(default_boxes)
     
-    # Encode according to SSD paper
     encoded_boxes = torch.zeros_like(g_boxes)
-    # (gx - dx) / dw -> cx
-    encoded_boxes[:, 0] = (g_boxes[:, 0] - d_boxes[:, 0]) / (d_boxes[:, 2] + 1e-8)
-    # (gy - dy) / dh -> cy
-    encoded_boxes[:, 1] = (g_boxes[:, 1] - d_boxes[:, 1]) / (d_boxes[:, 3] + 1e-8)
-    # log(gw / dw) -> width
-    encoded_boxes[:, 2] = torch.log(g_boxes[:, 2] / (d_boxes[:, 2] + 1e-8) + 1e-8)
-    # log(gh / dh) -> height
-    encoded_boxes[:, 3] = torch.log(g_boxes[:, 3] / (d_boxes[:, 3] + 1e-8) + 1e-8)
+    encoded_boxes[:, 0] = (g_boxes[:, 0] - d_boxes[:, 0]) / (d_boxes[:, 2] * variance[0] + 1e-8)
+    encoded_boxes[:, 1] = (g_boxes[:, 1] - d_boxes[:, 1]) / (d_boxes[:, 3] * variance[0] + 1e-8)
+    encoded_boxes[:, 2] = torch.log(g_boxes[:, 2] / (d_boxes[:, 2] + 1e-8) + 1e-8) / variance[1]
+    encoded_boxes[:, 3] = torch.log(g_boxes[:, 3] / (d_boxes[:, 3] + 1e-8) + 1e-8) / variance[1]
     
     return encoded_boxes
 
-# Improved SSD loss with GIoU
 class SSD_loss(nn.Module):
-    def __init__(self, num_classes, default_boxes, device, alpha=0.5, gamma=1.5):
-        """
-        Improved SSD Loss function with GIoU and Focal Loss
-
-        Args:
-            num_classes (int): Number of object classes
-            default_boxes (torch.Tensor): Default anchor boxes (in corner format)
-            device (torch.device): GPU or CPU
-            alpha (float): Weighting factor in focal loss
-            gamma (float): Focusing parameter in focal loss
-        """
+    def __init__(self, num_classes, default_boxes, device, alpha=0.25, gamma=1.5, 
+                 lambda_loc=1.5, lambda_conf=1.0, variance=[0.1, 0.1]):
         super(SSD_loss, self).__init__()
-        
         self.num_classes = num_classes
         self.default_boxes = default_boxes.to(device)
         self.device = device
-        
-        # Focal loss parameters
         self.alpha = alpha
         self.gamma = gamma
-        
-        self.threshold = 0.5  # IoU threshold for positive matches
-        self.neg_pos_ratio = 3  # Ratio of negative to positive samples
-        
+        self.lambda_loc = lambda_loc
+        self.lambda_conf = lambda_conf
+        self.variance = variance
+
+        self.threshold = 0.4
+        self.neg_pos_ratio = 2
+
+        self.smooth_l1 = nn.SmoothL1Loss(reduction='none')
         self.cross_entropy = nn.CrossEntropyLoss(reduction='none')
+        
+        # Initialize class weights (higher for rare classes)
+        self.class_weights = torch.ones(num_classes, device=device)
+        
+        # Pascal VOC class frequency adjustments
+        # Background is index 0
+        # Rare classes (bird=3, boat=4, bottle=5, chair=9, cow=10, diningtable=11, 
+        # pottedplant=16, sheep=17, sofa=18)
+        rare_classes = [3, 4, 5, 9, 10, 11, 16, 17, 18]
+        # Common classes (person=15, car=7, dog=12, cat=8)
+        common_classes = [15, 7, 12, 8]
+        
+        # Adjust weights based on class frequency
+        for cls in rare_classes:
+            self.class_weights[cls] = 2.0  # Higher weight for rare classes
+            
+        for cls in common_classes:
+            self.class_weights[cls] = 0.75  # Lower weight for common classes
+            
+        # Background class (0) gets slightly lower weight
+        self.class_weights[0] = 0.5
     
     def focal_loss(self, pred, target):
-        """
-        Compute focal loss for classification
-        
-        Args:
-            pred (torch.Tensor): Predicted class scores [N, num_classes]
-            target (torch.Tensor): Target classes [N]
-            
-        Returns:
-            torch.Tensor: Focal loss values
-        """
-        # Compute standard cross entropy loss
         ce_loss = self.cross_entropy(pred, target)
-        
-        # Get probability of the target class (p_t)
         pred_softmax = torch.nn.functional.softmax(pred, dim=1)
-        p_t = pred_softmax.gather(1, target.unsqueeze(1)).squeeze(1)
+        pt = pred_softmax.gather(1, target.unsqueeze(1)).squeeze(1)
         
-        # Calculate focal weight: alpha * (1-p_t)^gamma
-        focal_weight = self.alpha * (1 - p_t).pow(self.gamma)
+        # Apply class weights based on target classes
+        class_weight = self.class_weights[target]
         
-        # Apply weight to cross entropy loss
-        focal_loss = focal_weight * ce_loss
+        # Combine focal weight with class weight
+        focal_weight = self.alpha * (1 - pt).pow(self.gamma) * class_weight
         
-        return focal_loss
+        return focal_weight * ce_loss
     
     def forward(self, predictions, targets):
-        """
-        Compute SSD loss with GIoU for localization and focal loss for classification.
-
-        Args:
-            predictions (tuple): (loc_preds, conf_preds, default_boxes)
-                - loc_preds: Shape (batch_size, num_priors, 4)
-                - conf_preds: Shape (batch_size, num_priors, num_classes)
-                - default_boxes: Default boxes used in the model
-            targets (dict): {"boxes": [list of GT boxes], "labels": [list of GT labels]}
-        
-        Returns:
-            torch.Tensor: Total loss (scalar)
-        """
         loc_preds, conf_preds, _ = predictions
         batch_size = loc_preds.size(0)
         num_priors = self.default_boxes.size(0)
         
-        # Create empty tensors for the targets
+        # Prepare target tensors
         loc_t = torch.zeros(batch_size, num_priors, 4).to(self.device)
         conf_t = torch.zeros(batch_size, num_priors, dtype=torch.long).to(self.device)
         
-        # For each image in the batch
+        # Track positives for each batch
+        batch_positives = []
+        
         for idx in range(batch_size):
-            truths = targets['boxes'][idx]  # Ground truth boxes
-            labels = targets['labels'][idx]  # Ground truth labels
-            
-            if truths.size(0) == 0:  # Skip if no ground truth boxes
+            truths = targets['boxes'][idx]
+            labels = targets['labels'][idx]
+            if truths.size(0) == 0:
+                batch_positives.append(0)
                 continue
             
-            # Calculate IoU between default boxes and ground truth boxes
+            # Match default boxes to ground truth
             overlaps = box_iou(self.default_boxes, truths)
             
-            # For each default box, find the best matching ground truth box
+            # For each default box, find best matching GT
             best_truth_overlap, best_truth_idx = overlaps.max(1)
             
-            # For each ground truth box, find the best matching default box
+            # For each GT, ensure it's matched to at least one default box
             best_prior_overlap, best_prior_idx = overlaps.max(0)
-            # Make sure each ground truth box has at least one matching default box
             for j in range(best_prior_idx.size(0)):
                 best_truth_idx[best_prior_idx[j]] = j
-                best_truth_overlap[best_prior_idx[j]] = 2.0  # Ensure it's greater than threshold
+                best_truth_overlap[best_prior_idx[j]] = 2.0  # Ensure it's positive
             
-            # Get matched ground truth boxes and labels
+            # Extract matched boxes and labels
             matches = truths[best_truth_idx]
             match_labels = labels[best_truth_idx]
             
-            # Set background label (0) for boxes with low overlap
-            match_labels[best_truth_overlap < self.threshold] = 0
+            # Mark positives (IoU > threshold)
+            match_labels[best_truth_overlap < self.threshold] = 0  # Background
             
-            # Encode the ground truth boxes relative to default boxes
-            loc_t[idx] = encode_boxes(matches, self.default_boxes)
+            # Encode matched boxes
+            loc_t[idx] = encode_boxes(matches, self.default_boxes, self.variance)
             conf_t[idx] = match_labels
+            
+            # Count positives
+            batch_positives.append((match_labels > 0).sum().item())
         
-        # Compute positive mask (where gt label > 0)
-        pos = conf_t > 0
-        num_pos = pos.sum().item()
-        
-        # Skip loss calculation if there are no positive examples
+        # Check for positives
+        num_pos = sum(batch_positives)
         if num_pos == 0:
-            return torch.tensor(0.0).to(self.device)
+            print("WARNING: No positive matches in batch, returning minimal loss")
+            return torch.tensor(0.001, requires_grad=True, device=self.device)
         
-        # Localization loss with GIoU loss
-        # First, decode predicted boxes
+        # Create mask for positive examples
+        pos = conf_t > 0
         pos_idx = pos.unsqueeze(2).expand_as(loc_preds)
         
-        # Get positive predictions and targets
+        # Localization loss - only for positive matches
         pos_loc_preds = loc_preds[pos_idx].view(-1, 4)
         pos_loc_targets = loc_t[pos_idx].view(-1, 4)
         
-        # Decode predictions to get actual boxes
-        decoded_boxes = decode_boxes(pos_loc_preds, self.default_boxes.repeat(batch_size, 1, 1)[pos_idx].view(-1, 4))
-        decoded_targets = decode_boxes(pos_loc_targets, self.default_boxes.repeat(batch_size, 1, 1)[pos_idx].view(-1, 4))
+        # Use smooth L1 loss for localization
+        loc_loss = self.smooth_l1(pos_loc_preds, pos_loc_targets).sum(dim=1).mean()
         
-        # Compute GIoU loss
-        loc_loss = giou_loss(decoded_boxes, decoded_targets).mean()
-        
-        # Confidence loss with focal loss
-        # Reshape confidence predictions to [batch_size * num_priors, num_classes]
+        # Hard negative mining for classification
         batch_conf = conf_preds.view(-1, self.num_classes)
         
-        # Use focal loss for all examples
-        # No need for hard negative mining since focal loss naturally handles class imbalance
-        conf_loss = self.focal_loss(batch_conf, conf_t.view(-1))
+        # Loss for all examples
+        loss_c = self.focal_loss(batch_conf, conf_t.view(-1))
+        loss_c = loss_c.view(batch_size, -1)
         
-        # Sum loss values to get a scalar
-        conf_loss = conf_loss.sum()
+        # Hard negative mining
+        loss_c[pos] = 0  # Filter out positive boxes
+        _, loss_idx = loss_c.sort(1, descending=True)
+        _, idx_rank = loss_idx.sort(1)
+        num_neg = torch.clamp(self.neg_pos_ratio * pos.sum(1), max=pos.size(1)-1)
+        neg = idx_rank < num_neg.unsqueeze(1).expand_as(idx_rank)
         
-        # Normalize by number of positive examples
-        pos_count = max(1, num_pos)  # Avoid division by zero
-        conf_loss /= pos_count
+        # Combined positive and negative examples
+        pos_idx = pos.view(-1, 1).expand_as(batch_conf)
+        neg_idx = neg.view(-1, 1).expand_as(batch_conf)
+        conf_p = batch_conf[(pos_idx+neg_idx).gt(0)].view(-1, self.num_classes)
+        targets_weighted = conf_t.view(-1)[(pos+neg).view(-1)]
         
-        # Return scalar total loss - balance localization and classification loss
-        total_loss = loc_loss + conf_loss
+        # Final classification loss
+        conf_loss = self.focal_loss(conf_p, targets_weighted).mean()
+        
+        # Combined loss
+        total_loss = self.lambda_loc * loc_loss + self.lambda_conf * conf_loss
+        
+        # Safety check for NaNs
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            print("WARNING: NaN or Inf loss detected!")
+            print(f"loc_loss: {loc_loss.item()}, conf_loss: {conf_loss.item()}")
+            return torch.tensor(0.1, device=self.device, requires_grad=True)
+        
         return total_loss
 
-def decode_boxes(loc, default_boxes):
-    """Decode predicted box coordinates from offsets"""
-    # Ensure both tensors are on the same device
+def decode_boxes(loc, default_boxes, variance=[0.1, 0.2], clamp_val=4.0):
+    """
+    Decode predicted box coordinates from offsets with variance scaling.
+    """
     device = loc.device
     default_boxes = default_boxes.to(device)
-    
-    # Convert default boxes from (xmin, ymin, xmax, ymax) to (cx, cy, w, h)
+
     def corner_to_center(boxes):
         width = boxes[:, 2] - boxes[:, 0]
         height = boxes[:, 3] - boxes[:, 1]
         cx = boxes[:, 0] + width / 2
         cy = boxes[:, 1] + height / 2
         return torch.stack([cx, cy, width, height], dim=1)
-    
-    # Convert default boxes to center format
+
     default_boxes_center = corner_to_center(default_boxes)
     
-    # Decode predictions
-    pred_cx = loc[:, 0] * default_boxes_center[:, 2] + default_boxes_center[:, 0]
-    pred_cy = loc[:, 1] * default_boxes_center[:, 3] + default_boxes_center[:, 1]
-    pred_w = torch.exp(loc[:, 2]) * default_boxes_center[:, 2]
-    pred_h = torch.exp(loc[:, 3]) * default_boxes_center[:, 3]
+    # Clamp the width and height offsets for stability
+    loc_w = torch.clamp(loc[:, 2] * variance[1], min=-clamp_val, max=clamp_val)
+    loc_h = torch.clamp(loc[:, 3] * variance[1], min=-clamp_val, max=clamp_val)
+
+    pred_cx = default_boxes_center[:, 0] + loc[:, 0] * variance[0] * default_boxes_center[:, 2]
+    pred_cy = default_boxes_center[:, 1] + loc[:, 1] * variance[0] * default_boxes_center[:, 3]
+    pred_w = default_boxes_center[:, 2] * torch.exp(loc_w)
+    pred_h = default_boxes_center[:, 3] * torch.exp(loc_h)
+
+    boxes_decoded = torch.zeros_like(loc)
+    boxes_decoded[:, 0] = pred_cx - pred_w / 2
+    boxes_decoded[:, 1] = pred_cy - pred_h / 2
+    boxes_decoded[:, 2] = pred_cx + pred_w / 2
+    boxes_decoded[:, 3] = pred_cy + pred_h / 2
     
-    # Convert back to corner format
-    boxes = torch.zeros_like(loc)
-    boxes[:, 0] = pred_cx - pred_w / 2
-    boxes[:, 1] = pred_cy - pred_h / 2
-    boxes[:, 2] = pred_cx + pred_w / 2
-    boxes[:, 3] = pred_cy + pred_h / 2
-    
-    return boxes
+    # Clamp to valid range
+    boxes_decoded = torch.clamp(boxes_decoded, 0, 1)
+
+    return boxes_decoded
 
 # Instantiate the SSD model
 model = SSD(num_classes=num_classes)
@@ -845,8 +740,12 @@ model.to(device)
 # Initialize the SSD loss function
 SSDLoss = SSD_loss(
     num_classes=num_classes, 
-    default_boxes=model.default_boxes_xyxy,  # Use boxes in corner format
-    device=device
+    default_boxes=model.default_boxes_xyxy,
+    device=device,
+    alpha=0.25,  # Reduced from 1.0
+    gamma=1.5,   # Reduced from 2.0
+    lambda_loc=1.5,  # Increase localization loss weight
+    lambda_conf=1.0
 )
 
 # Freeze first 2 feature extractors (first few layers of EfficientNet)
@@ -856,220 +755,126 @@ for i in range(2):  # Freeze first 2 feature extractors
 
 # Define optimizer with SGD and momentum
 optimizer = optim.SGD([
-    {'params': model.feature_extractors[2].parameters(), 'lr': 0.00141},  
-    {'params': model.feature_extractors[3].parameters(), 'lr': 0.00141},  
-    {'params': model.feature_extractors[4].parameters(), 'lr': 0.00141},  
-    {'params': model.extra_layer1.parameters(), 'lr': 0.00283},          
-    {'params': model.extra_layer2.parameters(), 'lr': 0.00283},          
-    {'params': model.fpn.parameters(), 'lr': 0.00283},                   
-    {'params': model.loc_layers.parameters(), 'lr': 0.00283},            
-    {'params': model.conf_layers.parameters(), 'lr': 0.00283}            
-], lr=0.00141, momentum=0.9, weight_decay=4e-5)
+    {'params': model.feature_extractors[2:].parameters(), 'lr': 5e-5},
+    {'params': model.extra_layer1.parameters(), 'lr': 1e-4},
+    {'params': model.extra_layer2.parameters(), 'lr': 1e-4},
+    {'params': model.fpn.parameters(), 'lr': 1e-4},
+    {'params': model.loc_layers.parameters(), 'lr': 2e-5},
+    {'params': model.conf_layers.parameters(), 'lr': 5e-5}
+], lr=5e-5, momentum=0.9, weight_decay=5e-4)
 
-# Three-phase learning rate scheduler
-def get_three_phase_scheduler(optimizer, warmup_epochs=5, plateau_epochs=95, max_epochs=150):
-    # Define warmup phase (linear increase)
-    def warmup_lambda(epoch):
-        if epoch < warmup_epochs:
-            return float(epoch) / float(max(1, warmup_epochs))
-        return 1.0
-    
-    warmup_scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
-    
-    # Define high plateau phase (constant)
-    plateau_scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=plateau_epochs, gamma=1.0)
-    
-    # Define cosine decay phase
-    cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max_epochs-(warmup_epochs+plateau_epochs), eta_min=1e-6
-    )
-    
-    return warmup_scheduler, plateau_scheduler, cosine_scheduler
-
-# Get schedulers for three-phase learning
-warmup_scheduler, plateau_scheduler, cosine_scheduler = get_three_phase_scheduler(
-    optimizer, warmup_epochs=5, plateau_epochs=95, max_epochs=150
+scheduler = optim.lr_scheduler.OneCycleLR(
+    optimizer, 
+    max_lr=[1e-4, 2e-4, 2e-4, 2e-4, 5e-5, 1e-4],  # Lower peak rates
+    steps_per_epoch=len(train_loader),
+    epochs=150,
+    pct_start=0.4,  # More warmup time
+    div_factor=25,
+    final_div_factor=10000,
+    anneal_strategy='cos'
 )
 
 # mAP calculation function
-def calculate_mAP(model, data_loader, device, iou_threshold=0.5):
+def calculate_mAP(model, data_loader, device, conf_threshold=0.05, top_k=200):
     """
-    Calculate Mean Average Precision (mAP) for object detection model
-    
-    Args:
-        model: SSD model
-        data_loader: DataLoader for evaluation data
-        device: Device to run evaluation on
-        iou_threshold: IoU threshold for considering a prediction as correct
-        
-    Returns:
-        float: mAP value
+    Enhanced mAP calculation with better debugging
     """
     model.eval()
+    metric = MeanAveragePrecision().to(device)
+    metric.box_format = "xyxy"  # Ensure correct box format
+    all_preds = []
+    all_targets = []
     
-    # Initialize dictionaries to store predictions and ground truths
-    all_predictions = defaultdict(list)
-    all_ground_truths = defaultdict(list)
-    
+    print("Starting mAP calculation...")
     with torch.no_grad():
-        for batch_idx, batch in enumerate(tqdm(data_loader, desc='Calculating mAP')):
-            # Move data to device
+        for batch in tqdm(data_loader, desc="Calculating mAP"):
             images = batch['images'].to(device)
-            gt_boxes_batch = batch['boxes']
-            gt_labels_batch = batch['labels']
+            batch_size = images.size(0)
             
             # Forward pass
             loc_preds, conf_preds, default_boxes = model(images)
             
-            batch_size = images.size(0)
-            
-            # Process each image in the batch
+            # Process each image in batch
             for i in range(batch_size):
-                gt_boxes = gt_boxes_batch[i].to(device)
-                gt_labels = gt_labels_batch[i].to(device)
-                
-                # Skip if no ground truth boxes
-                if gt_boxes.size(0) == 0:
-                    continue
-                
-                # Store ground truths
-                for box, label in zip(gt_boxes, gt_labels):
-                    label_idx = label.item()
-                    if label_idx == 0:  # Skip background
-                        continue
-                    all_ground_truths[label_idx].append({
-                        'box': box.cpu().numpy(),
-                        'matched': False  # For matching predictions
-                    })
-                
-                # Process predictions
-                # Get confidence scores
+                # Calculate confidence scores
                 scores = torch.nn.functional.softmax(conf_preds[i], dim=1)
                 
-                # Decode predicted boxes
-                decoded_boxes = decode_boxes(loc_preds[i], default_boxes)
+                # Decode boxes
+                boxes = decode_boxes(loc_preds[i], default_boxes.to(device), variance=[0.1, 0.1])
                 
-                # For each class
-                for class_idx in range(1, model.num_classes):  # Skip background class
-                    class_scores = scores[:, class_idx]
-                    mask = class_scores > 0.01  # Low threshold to get more predictions
+                # Store predictions by class
+                pred_boxes_all = []
+                pred_scores_all = []
+                pred_labels_all = []
+                
+                # Process each class
+                for c in range(1, model.num_classes):  # Skip background
+                    # Get scores for this class
+                    class_scores = scores[:, c]
                     
+                    # Filter by confidence threshold
+                    mask = class_scores > conf_threshold
                     if mask.sum() == 0:
                         continue
+                        
+                    # Get filtered boxes
+                    class_boxes = boxes[mask]
+                    class_scores = class_scores[mask]
                     
-                    # Get boxes and scores for this class
-                    class_boxes = decoded_boxes[mask]
-                    class_scores_filtered = class_scores[mask]
+                    # Take top-k if needed
+                    if len(class_scores) > top_k:
+                        _, idx = class_scores.topk(top_k)
+                        class_boxes = class_boxes[idx]
+                        class_scores = class_scores[idx]
                     
-                    # Apply non-maximum suppression
-                    keep_idx = torchvision.ops.nms(class_boxes, class_scores_filtered, iou_threshold=0.45)
+                    # Apply NMS
+                    keep_idx = torchvision.ops.nms(class_boxes, class_scores, iou_threshold=0.5)
+                    class_boxes = class_boxes[keep_idx]
+                    class_scores = class_scores[keep_idx]
                     
-                    # Store predictions
-                    for idx in keep_idx:
-                        all_predictions[class_idx].append({
-                            'box': class_boxes[idx].cpu().numpy(),
-                            'score': class_scores_filtered[idx].item()
-                        })
-    
-    # Calculate AP for each class
-    average_precisions = []
-    
-    # For each class
-    for class_idx in range(1, model.num_classes):  # Skip background
-        if class_idx not in all_predictions or class_idx not in all_ground_truths:
-            # Skip classes with no predictions or ground truths
-            continue
-        
-        # Sort predictions by descending score
-        predictions = sorted(all_predictions[class_idx], key=lambda x: x['score'], reverse=True)
-        
-        # Get total number of ground truths for this class
-        num_gts = len(all_ground_truths[class_idx])
-        
-        if num_gts == 0:
-            continue
-        
-        # Initialize lists for true positives and false positives
-        true_positives = []
-        false_positives = []
-        
-        # Process each prediction
-        for pred in predictions:
-            # Find the best matching ground truth
-            best_iou = -1
-            best_gt_idx = -1
-            
-            for gt_idx, gt in enumerate(all_ground_truths[class_idx]):
-                if gt['matched']:
-                    continue
+                    # Add to predictions
+                    pred_boxes_all.append(class_boxes)
+                    pred_scores_all.append(class_scores)
+                    pred_labels_all.extend([c] * len(class_boxes))
                 
-                # Calculate IoU
-                iou = calculate_box_iou(pred['box'], gt['box'])
+                # Format predictions and targets
+                if len(pred_boxes_all) > 0:
+                    pred_boxes_cat = torch.cat(pred_boxes_all)
+                    pred_scores_cat = torch.cat(pred_scores_all)
+                    pred_labels_cat = torch.tensor(pred_labels_all, device=device)
+                else:
+                    pred_boxes_cat = torch.zeros((0, 4), device=device)
+                    pred_scores_cat = torch.zeros(0, device=device)
+                    pred_labels_cat = torch.zeros(0, dtype=torch.int64, device=device)
                 
-                if iou > best_iou:
-                    best_iou = iou
-                    best_gt_idx = gt_idx
-            
-            # Check if this prediction is a true positive
-            if best_iou >= iou_threshold:
-                all_ground_truths[class_idx][best_gt_idx]['matched'] = True
-                true_positives.append(1)
-                false_positives.append(0)
-            else:
-                true_positives.append(0)
-                false_positives.append(1)
-        
-        # Calculate cumulative sums
-        cum_true_positives = np.cumsum(true_positives)
-        cum_false_positives = np.cumsum(false_positives)
-        
-        # Calculate precision and recall
-        precision = cum_true_positives / (cum_true_positives + cum_false_positives)
-        recall = cum_true_positives / num_gts
-        
-        # Add a sentinel value at the end for AUC calculation
-        precision = np.append(precision, 0)
-        recall = np.append(recall, 1)
-        
-        # Compute AP using 11-point interpolation
-        ap = 0
-        for t in np.arange(0, 1.1, 0.1):
-            if np.sum(recall >= t) == 0:
-                p = 0
-            else:
-                p = np.max(precision[recall >= t])
-            ap += p / 11
-        
-        average_precisions.append(ap)
+                # Add to metric
+                all_preds.append({
+                    'boxes': pred_boxes_cat.cpu(),
+                    'scores': pred_scores_cat.cpu(),
+                    'labels': pred_labels_cat.cpu()
+                })
+                
+                all_targets.append({
+                    'boxes': batch['boxes'][i].cpu(),
+                    'labels': batch['labels'][i].cpu()
+                })
     
-    # Calculate mean AP
-    mAP = np.mean(average_precisions) if average_precisions else 0.0
+    # Compute mAP
+    metric.update(all_preds, all_targets)
+    results = metric.compute()
+    
+    # Print detailed results
+    mAP = results['map'].item()
+    mAP_50 = results['map_50'].item()
+    mAP_75 = results['map_75'].item()
+    
+    print(f"mAP: {mAP:.4f}, mAP@0.5: {mAP_50:.4f}, mAP@0.75: {mAP_75:.4f}")
     
     return mAP
 
-def calculate_box_iou(box1, box2):
-    """Calculate IoU between two boxes"""
-    # Calculate intersection area
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-    
-    intersection = max(0, x2 - x1) * max(0, y2 - y1)
-    
-    # Calculate union area
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union = area1 + area2 - intersection
-    
-    # Calculate IoU
-    iou = intersection / union if union > 0 else 0
-    
-    return iou
-
 # Training loop with mAP calculation
-def train_model(model, loss_fn, optimizer, warmup_scheduler, plateau_scheduler, cosine_scheduler, 
-                train_loader, val_loader, epochs, warmup_epochs=5, plateau_epochs=95, checkpoint_dir='./checkpoints'):
+def train_model(model, loss_fn, optimizer, scheduler, train_loader, val_loader, 
+                epochs, warmup_epochs=5, plateau_epochs=95, checkpoint_dir='./checkpoints'):
     """
     Enhanced training loop with three-phase learning rate schedule and mAP calculation
     
@@ -1077,7 +882,7 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, plateau_scheduler, 
         model: SSD model
         loss_fn: Loss function
         optimizer: Optimizer
-        warmup_scheduler, plateau_scheduler, cosine_scheduler: Phase-specific schedulers
+        scheduler: scheduler
         train_loader: Training data loader
         val_loader: Validation data loader
         epochs: Number of epochs to train for
@@ -1094,7 +899,7 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, plateau_scheduler, 
     
     # For early stopping
     best_val_map = 0.0
-    patience = 7
+    patience = 17
     patience_counter = 0
     
     # Initialize gradient scaler for mixed precision training
@@ -1154,22 +959,7 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, plateau_scheduler, 
             if (batch_idx + 1) % 20 == 0:
                 print(f"  Batch {batch_idx+1}/{len(train_loader)} - Loss: {loss.item():.4f}")
         
-        # Update learning rate schedulers based on current phase
-        if epoch < warmup_epochs:
-            # During warmup phase
-            warmup_scheduler.step()
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f"  Warmup phase: learning rate set to {current_lr:.6f}")
-        elif epoch < warmup_epochs + plateau_epochs:
-            # During plateau phase
-            plateau_scheduler.step()
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f"  Plateau phase: learning rate set to {current_lr:.6f}")
-        else:
-            # During cosine annealing phase
-            cosine_scheduler.step()
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f"  Cosine phase: learning rate set to {current_lr:.6f}")
+        scheduler.step()
 
         # Calculate average training loss
         avg_train_loss = epoch_loss / max(1, batch_count)
@@ -1224,7 +1014,7 @@ def train_model(model, loss_fn, optimizer, warmup_scheduler, plateau_scheduler, 
             print(f"  Epoch {epoch+1} completed in {duration}")
             print(f"  Train Loss: {avg_train_loss:.4f}")
             print(f"  Val Loss: {avg_val_loss:.4f}")
-            print(f"  Val mAP@0.5: {val_map:.4f}")
+            print(f"  Val mAP: {val_map:.4f}")
             
             # Save checkpoint if this is the best model so far (based on mAP)
             if val_map > best_val_map:
@@ -1422,9 +1212,7 @@ history = train_model(
     model=model,
     loss_fn=SSDLoss,
     optimizer=optimizer,
-    warmup_scheduler=warmup_scheduler,
-    plateau_scheduler=plateau_scheduler,
-    cosine_scheduler=cosine_scheduler,
+    scheduler=scheduler,
     train_loader=train_loader,
     val_loader=val_loader,
     epochs=150,
