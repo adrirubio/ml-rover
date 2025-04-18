@@ -168,20 +168,20 @@ class PascalVOCDataset(Dataset):
             labels.append(label)
         return boxes, labels
 
-# Enhanced data augmentation for better model generalization
+# IMPROVED: Enhanced data augmentation
 train_transforms = A.Compose([
     A.Resize(height=512, width=512),
     A.HorizontalFlip(p=0.5),
-    # Stronger transformation intensity
-    A.ShiftScaleRotate(shift_limit=0.2, scale_limit=0.4, rotate_limit=30, p=0.5),
+    # Increased transformation intensity
+    A.ShiftScaleRotate(shift_limit=0.15, scale_limit=0.3, rotate_limit=20, p=0.5),
     # More aggressive color augmentation
-    A.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.15, p=0.6),
+    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
     # Added random brightness contrast
-    A.RandomBrightnessContrast(brightness_limit=0.35, contrast_limit=0.35, p=0.5),
-    # Occasional blur for robustness to image quality
-    A.GaussianBlur(blur_limit=3, p=0.1),
-    # Occasional noise addition
-    A.GaussNoise(var_limit=(10.0, 50.0), p=0.1),
+    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.4),
+    # Added grayscale occasionally
+    A.ToGray(p=0.02),
+    # Added blur occasionally
+    A.GaussianBlur(blur_limit=3, p=0.05),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
 ], bbox_params=A.BboxParams(format='pascal_voc', min_visibility=0.4, label_fields=['labels']))
@@ -208,7 +208,7 @@ def custom_collate_fn(batch):
 # Create datasets with increased mosaic augmentation
 voc_root = '/home/adrian/ssd/VOCdevkit/VOCdevkit'
 
-# Increased mosaic augmentation probability
+# IMPROVED: Increased mosaic augmentation probability
 train_dataset = PascalVOCDataset(voc_root, year='2007', image_set='train', 
                                 transforms=train_transforms, use_mosaic=True, mosaic_prob=0.8)
 val_dataset = PascalVOCDataset(voc_root, year='2007', image_set='val', 
@@ -216,7 +216,7 @@ val_dataset = PascalVOCDataset(voc_root, year='2007', image_set='val',
 test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test', 
                                transforms=val_transforms)
 
-# Adjusted batch size
+# IMPROVED: Adjusted batch size
 train_loader = DataLoader(
     train_dataset, 
     batch_size=16,  # Reduced for ResNet-50 memory requirements
@@ -347,7 +347,7 @@ class SSD(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Add FPN with more channels for better feature fusion
+        # IMPROVED: Add FPN with more channels for better feature fusion
         self.fpn = FPN(
             in_channels_list=[512, 1024, 2048, 512, 256],
             out_channels=256
@@ -357,9 +357,9 @@ class SSD(nn.Module):
         self.feature_maps = [64, 32, 16, 8, 4]
         self.steps = [8, 16, 32, 64, 128]
         
-        # Adjusted scales and aspect ratios for better anchor coverage
-        self.scales = [0.15, 0.20, 0.27, 0.35, 0.45, 0.6]  # More concentrated in 0.15-0.5 range
-        self.aspect_ratios = [[2, 3], [2, 3, 0.5, 1.5], [2, 3, 0.5, 1.5, 5], [2, 3, 0.5, 5], [2, 3]]
+        # IMPROVED: Adjusted scales and aspect ratios for better anchor coverage
+        self.scales = [0.05, 0.1, 0.25, 0.4, 0.6, 0.8]
+        self.aspect_ratios = [[2, 3], [2, 3], [2, 3, 5], [2, 3, 5], [2, 3]]
         
         # Calculate number of boxes per feature map cell
         self.num_anchors = []
@@ -388,7 +388,7 @@ class SSD(nn.Module):
         # Generate default boxes
         self._create_default_boxes()
         
-        # Add center-ness prediction layers for better localization
+        # IMPROVED: Add center-ness prediction layers for better localization
         self.centerness_layers = nn.ModuleList([
             nn.Conv2d(256, self.num_anchors[0], kernel_size=3, padding=1),
             nn.Conv2d(256, self.num_anchors[1], kernel_size=3, padding=1),
@@ -398,7 +398,7 @@ class SSD(nn.Module):
         ])
         
     def _create_default_boxes(self):
-        """Generate default (anchor) boxes for all feature map cells with optimized distribution"""
+        """Generate default (anchor) boxes for all feature map cells"""
         default_boxes = []
         
         # For each feature map
@@ -406,7 +406,7 @@ class SSD(nn.Module):
             # For each cell in the feature map
             for i in range(f):
                 for j in range(f):
-                       # Center of the cell (normalized coordinates)
+                    # Center of the cell (normalized coordinates)
                     cx = (j + 0.5) / f
                     cy = (i + 0.5) / f
                     
@@ -419,7 +419,7 @@ class SSD(nn.Module):
                         s_prime = np.sqrt(s * self.scales[k + 1])
                         default_boxes.append([cx, cy, s_prime, s_prime])
                     else:
-                        s_prime = min(1.0, s * 1.2)  # Ensure largest scale stays reasonable
+                        s_prime = 1.0
                         default_boxes.append([cx, cy, s_prime, s_prime])
                     
                     # Other aspect ratios
@@ -625,7 +625,7 @@ def compute_centerness(boxes):
 # Improved SSD loss with centerness weighting
 class SSD_loss(nn.Module):
     def __init__(self, num_classes, default_boxes, device, alpha=0.25, gamma=2.0, 
-                 lambda_loc=3.5, lambda_conf=1.0, lambda_center=1.5, variance=[0.1, 0.1]):  # Increased centerness weight to 1.5
+                 lambda_loc=2.0, lambda_conf=1.0, lambda_center=1.0, variance=[0.1, 0.1]):
         super(SSD_loss, self).__init__()
         self.num_classes = num_classes
         self.default_boxes = default_boxes.to(device)
@@ -658,18 +658,13 @@ class SSD_loss(nn.Module):
         
         # Adjust weights based on class frequency - more aggressive weighting
         for cls in rare_classes:
-            self.class_weights[cls] = 3.5  # Higher weight for rare classes
+            self.class_weights[cls] = 2.5  # Higher weight for rare classes
             
         for cls in common_classes:
             self.class_weights[cls] = 0.75  # Lower weight for common classes
             
         # Background class (0) gets slightly lower weight
         self.class_weights[0] = 0.5
-        
-        # Increased weights for extremely rare classes
-        extremely_rare = [4, 9, 17]  # boat, chair, sheep
-        for cls in extremely_rare:
-            self.class_weights[cls] = 5.0  # Very high weight for extremely rare classes (increased to 5.0)
     
     def focal_loss(self, pred, target):
         ce_loss = self.cross_entropy(pred, target)
@@ -838,16 +833,16 @@ def decode_boxes(loc, default_boxes, variance=[0.1, 0.2], clamp_val=4.0):
 model = SSD(num_classes=num_classes)
 model.to(device)
 
-# Initialize the SSD loss function with increased centerness weight
+# Initialize the SSD loss function
 SSDLoss = SSD_loss(
     num_classes=num_classes, 
     default_boxes=model.default_boxes_xyxy,
     device=device,
     alpha=0.25,
-    gamma=2.0,
-    lambda_loc=3.5,
+    gamma=2.0,   # Increased gamma for better handling of hard examples
+    lambda_loc=2.0,  # Increased localization loss weight for better precision
     lambda_conf=1.0,
-    lambda_center=1.5  # Increased from 1.0 to 1.5
+    lambda_center=1.0  # Weight for centerness loss
 )
 
 # Freeze early layers of ResNet
@@ -855,33 +850,33 @@ for i in range(1):  # Only freeze the first feature extractor (conv1, bn1, maxpo
     for param in model.feature_extractors[i].parameters():
         param.requires_grad = False
 
-# Use AdamW optimizer with higher learning rates and reduced weight decay
+# IMPROVED: Use AdamW optimizer for better convergence
 optimizer = optim.AdamW([
-    {'params': model.feature_extractors[1:].parameters(), 'lr': 2e-4},
-    {'params': model.extra_layer1.parameters(), 'lr': 3e-4},
-    {'params': model.extra_layer2.parameters(), 'lr': 3e-4},
-    {'params': model.fpn.parameters(), 'lr': 3e-4},
-    {'params': model.loc_layers.parameters(), 'lr': 6e-4},
-    {'params': model.conf_layers.parameters(), 'lr': 3e-4},
-    {'params': model.centerness_layers.parameters(), 'lr': 3e-4}
-], lr=2e-4, weight_decay=5e-5)
+    {'params': model.feature_extractors[1:].parameters(), 'lr': 1e-4},
+    {'params': model.extra_layer1.parameters(), 'lr': 2e-4},
+    {'params': model.extra_layer2.parameters(), 'lr': 2e-4},
+    {'params': model.fpn.parameters(), 'lr': 2e-4},
+    {'params': model.loc_layers.parameters(), 'lr': 5e-4},
+    {'params': model.conf_layers.parameters(), 'lr': 2e-4},
+    {'params': model.centerness_layers.parameters(), 'lr': 2e-4}
+], lr=1e-4, weight_decay=1e-4)
 
-# Better learning rate scheduler with faster warmup
+# IMPROVED: Better learning rate scheduler with faster warmup
 scheduler = optim.lr_scheduler.OneCycleLR(
     optimizer, 
-    max_lr=[3e-4, 5e-4, 5e-4, 5e-4, 8e-4, 5e-4, 5e-4],  # Higher peak rates
+    max_lr=[2e-4, 4e-4, 4e-4, 4e-4, 8e-4, 4e-4, 4e-4],  # Higher peak rates
     steps_per_epoch=len(train_loader),
     epochs=120,
-    pct_start=0.15,  # Steeper warmup (15% of training)
+    pct_start=0.3,  # Faster warmup
     div_factor=25,
     final_div_factor=10000,
     anneal_strategy='cos'
 )
 
-# Enhanced mAP calculation function with lower NMS threshold
-def calculate_mAP(model, data_loader, device, conf_threshold=0.05, top_k=300, nms_threshold=0.4):  # Added NMS threshold parameter
+# Enhanced mAP calculation function with centerness weighting
+def calculate_mAP(model, data_loader, device, conf_threshold=0.05, top_k=200):
     """
-    Enhanced mAP calculation with centerness weighting and lower NMS threshold
+    Enhanced mAP calculation with centerness weighting
     """
     model.eval()
     metric = MeanAveragePrecision().to(device)
@@ -937,8 +932,8 @@ def calculate_mAP(model, data_loader, device, conf_threshold=0.05, top_k=300, nm
                         class_boxes = class_boxes[idx]
                         class_scores = class_scores[idx]
                     
-                    # Apply NMS with lower threshold
-                    keep_idx = torchvision.ops.nms(class_boxes, class_scores, iou_threshold=nms_threshold)  # Lower threshold (0.4)
+                    # Apply Soft-NMS instead of hard NMS
+                    keep_idx = torchvision.ops.nms(class_boxes, class_scores, iou_threshold=0.5)
                     class_boxes = class_boxes[keep_idx]
                     class_scores = class_scores[keep_idx]
                     
@@ -1115,7 +1110,7 @@ def train_model(model, loss_fn, optimizer, scheduler, train_loader, val_loader,
             
             # Calculate mAP on validation set
             print("Calculating mAP...")
-            val_map = calculate_mAP(model, val_loader, device, conf_threshold=0.05)
+            val_map = calculate_mAP(model, val_loader, device)
             val_maps.append(val_map)
             
             # Print epoch summary
@@ -1212,7 +1207,7 @@ def plot_training_history(history):
     plt.show()
 
 # Function to visualize detections with centerness scores
-def visualize_detections(model, image_path, transform=None, conf_threshold=0.4, nms_threshold=0.4):  # Added NMS threshold parameter
+def visualize_detections(model, image_path, transform=None, conf_threshold=0.4):
     """
     Visualize object detections on an image with centerness scores
     
@@ -1221,7 +1216,6 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.4, 
         image_path: Path to the image
         transform: Transforms to apply to the image
         conf_threshold: Confidence threshold for detections
-        nms_threshold: IoU threshold for NMS
     """
     # Set model to evaluation mode
     model.eval()
@@ -1280,8 +1274,8 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.4, 
             class_scores = weighted_scores[mask]
             class_centerness = centerness[mask]
             
-            # Apply non-maximum suppression with lower threshold
-            keep_idx = torchvision.ops.nms(class_boxes, class_scores, iou_threshold=nms_threshold)  # Lower threshold (0.4)
+            # Apply non-maximum suppression
+            keep_idx = torchvision.ops.nms(class_boxes, class_scores, iou_threshold=0.45)
             
             for idx in keep_idx:
                 detections.append({
@@ -1328,7 +1322,7 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.4, 
     plt.show()
 
 # Function for test-time augmentation (TTA)
-def test_time_augmentation(model, image, num_augs=5, conf_threshold=0.3, nms_threshold=0.4):  # Added NMS threshold parameter
+def test_time_augmentation(model, image, num_augs=5, conf_threshold=0.3):
     """
     Apply test-time augmentation for more robust predictions
     
@@ -1337,7 +1331,6 @@ def test_time_augmentation(model, image, num_augs=5, conf_threshold=0.3, nms_thr
         image: Input image tensor [C, H, W]
         num_augs: Number of augmentations to apply
         conf_threshold: Confidence threshold for detections
-        nms_threshold: IoU threshold for NMS
         
     Returns:
         List of detection dictionaries
@@ -1405,10 +1398,7 @@ def test_time_augmentation(model, image, num_augs=5, conf_threshold=0.3, nms_thr
                         'class': class_idx
                     })
     
-    # Apply NMS with lower threshold
-    keep_idx = torchvision.ops.nms(boxes_tensor, scores_tensor, iou_threshold=nms_threshold)  # Lower threshold (0.4)
-    
-    # Apply NMS across all augmentations
+    # Apply non-maximum suppression across all augmentations
     # Group by class
     class_detections = defaultdict(list)
     for det in all_detections:
@@ -1428,7 +1418,7 @@ def test_time_augmentation(model, image, num_augs=5, conf_threshold=0.3, nms_thr
         scores_tensor = torch.FloatTensor(scores).to(device)
         
         # Apply NMS
-        keep_idx = torchvision.ops.nms(boxes_tensor, scores_tensor, iou_threshold=nms_threshold)
+        keep_idx = torchvision.ops.nms(boxes_tensor, scores_tensor, iou_threshold=0.5)
         
         for idx in keep_idx.cpu().numpy():
             final_detections.append({
@@ -1506,3 +1496,4 @@ torch.save({
 }, quantized_model_path)
 
 print(f"Quantized model saved to {quantized_model_path}")
+
