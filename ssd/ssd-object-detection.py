@@ -176,8 +176,6 @@ train_transforms = A.Compose([
     A.ShiftScaleRotate(shift_limit=0.15, scale_limit=0.3, rotate_limit=20, p=0.5),
     # More aggressive color augmentation
     A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
-    # Added random crop and zoom for more diversity
-    A.RandomResizedCrop(height=512, width=512, scale=(0.8, 1.0), p=0.3),
     # Added random brightness contrast
     A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.4),
     # Added grayscale occasionally
