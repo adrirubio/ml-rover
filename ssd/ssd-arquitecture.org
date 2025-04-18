@@ -1,7 +1,7 @@
 # SSD Arquitecture
 
 - Model: SSD512
-- Base Network: EfficientNet-B1
+- Base Network: ResNet-50
 - Input Resolution: 512x512
 - Feature Maps: 6 scales for multi-scale detection
 - Default Boxes: ~24000 per image

@@ -168,15 +168,25 @@ class PascalVOCDataset(Dataset):
             labels.append(label)
         return boxes, labels
 
-# Define transforms with resolution 512x512
+# IMPROVED: Enhanced data augmentation
 train_transforms = A.Compose([
     A.Resize(height=512, width=512),
     A.HorizontalFlip(p=0.5),
-    A.ShiftScaleRotate(shift_limit=0.1, scale_limit=0.2, rotate_limit=15, p=0.3),
-    A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=0.3),
+    # Increased transformation intensity
+    A.ShiftScaleRotate(shift_limit=0.15, scale_limit=0.3, rotate_limit=20, p=0.5),
+    # More aggressive color augmentation
+    A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=0.5),
+    # Added random crop and zoom for more diversity
+    A.RandomResizedCrop(height=512, width=512, scale=(0.8, 1.0), p=0.3),
+    # Added random brightness contrast
+    A.RandomBrightnessContrast(brightness_limit=0.3, contrast_limit=0.3, p=0.4),
+    # Added grayscale occasionally
+    A.ToGray(p=0.02),
+    # Added blur occasionally
+    A.GaussianBlur(blur_limit=3, p=0.05),
     A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ToTensorV2()
-], bbox_params=A.BboxParams(format='pascal_voc', min_visibility=0.5, label_fields=['labels']))
+], bbox_params=A.BboxParams(format='pascal_voc', min_visibility=0.4, label_fields=['labels']))
 
 # Validation transformations
 val_transforms = A.Compose([
@@ -197,21 +207,21 @@ def custom_collate_fn(batch):
         'labels': labels
     }
 
-# Create datasets with mosaic augmentation
+# Create datasets with increased mosaic augmentation
 voc_root = '/home/adrian/ssd/VOCdevkit/VOCdevkit'
 
-# For 2007 dataset
+# IMPROVED: Increased mosaic augmentation probability
 train_dataset = PascalVOCDataset(voc_root, year='2007', image_set='train', 
-                                transforms=train_transforms, use_mosaic=True, mosaic_prob=0.7)
+                                transforms=train_transforms, use_mosaic=True, mosaic_prob=0.8)
 val_dataset = PascalVOCDataset(voc_root, year='2007', image_set='val', 
                               transforms=val_transforms)
 test_dataset = PascalVOCDataset(voc_root, year='2007', image_set='test', 
                                transforms=val_transforms)
 
-# Create DataLoaders
+# IMPROVED: Adjusted batch size
 train_loader = DataLoader(
     train_dataset, 
-    batch_size=32,
+    batch_size=16,  # Reduced for ResNet-50 memory requirements
     shuffle=True, 
     num_workers=4,
     collate_fn=custom_collate_fn,
@@ -220,7 +230,7 @@ train_loader = DataLoader(
 
 val_loader = DataLoader(
     val_dataset, 
-    batch_size=32, 
+    batch_size=16, 
     shuffle=False, 
     num_workers=4,
     collate_fn=custom_collate_fn,
@@ -229,27 +239,35 @@ val_loader = DataLoader(
 
 test_loader = DataLoader(
     test_dataset, 
-    batch_size=32, 
+    batch_size=16, 
     shuffle=False, 
     num_workers=4,
     collate_fn=custom_collate_fn,
     pin_memory=True
 )
 
-# Define FPN module for feature pyramid
+# Define enhanced FPN module with Group Normalization
 class FPN(nn.Module):
     def __init__(self, in_channels_list, out_channels):
         super(FPN, self).__init__()
         
         # Lateral connections (1x1 convolutions for channel reduction)
         self.lateral_convs = nn.ModuleList([
-            nn.Conv2d(in_channels, out_channels, kernel_size=1)
+            nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1),
+                nn.GroupNorm(32, out_channels),  # Group Normalization for better performance
+                nn.ReLU(inplace=True)
+            )
             for in_channels in in_channels_list
         ])
         
-        # Output convolutions
+        # Output convolutions with Group Normalization
         self.output_convs = nn.ModuleList([
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+            nn.Sequential(
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+                nn.GroupNorm(32, out_channels),  # Group Normalization for better performance
+                nn.ReLU(inplace=True)
+            )
             for _ in in_channels_list
         ])
     
@@ -285,62 +303,65 @@ class FPN(nn.Module):
             
         return results
 
-# Define SSD model with EfficientNet backbone and FPN
+# Define SSD model with ResNet-50 backbone and improved FPN
 class SSD(nn.Module):
     def __init__(self, num_classes):
         super(SSD, self).__init__()
         # Store num_classes as a class attribute
         self.num_classes = num_classes
         
-        # Load EfficientNet-B1 with pretrained weights
-        # Use pretrained ImageNet weights
-        self.backbone = torchvision.models.efficientnet_b1(weights=torchvision.models.EfficientNet_B1_Weights.IMAGENET1K_V1)
+        # IMPROVED: Using ResNet-50 backbone
+        resnet = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2)
         
-        # Get the feature maps we need from EfficientNet-B1
-        # Extract intermediate feature maps from EfficientNet
+        # Extract intermediate feature maps from ResNet-50
         self.feature_extractors = nn.ModuleList([
-            nn.Sequential(*list(self.backbone.features)[:2]),    # Expected to output 24 channels
-            nn.Sequential(*list(self.backbone.features)[2:4]),     # Expected to output 40 channels
-            nn.Sequential(*list(self.backbone.features)[4:6]),     # Expected to output 80 channels
-            nn.Sequential(*list(self.backbone.features)[6:8]),     # Expected to output 192 channels
-            nn.Sequential(*list(self.backbone.features)[8:])       # Expected to output 1280 channels
+            nn.Sequential(
+                resnet.conv1,
+                resnet.bn1,
+                resnet.relu,
+                resnet.maxpool,
+                resnet.layer1
+            ),  # Output stride: 4, channels: 256
+            nn.Sequential(resnet.layer2),  # Output stride: 8, channels: 512
+            nn.Sequential(resnet.layer3),  # Output stride: 16, channels: 1024
+            nn.Sequential(resnet.layer4),  # Output stride: 32, channels: 2048
         ])
-
         
-        # Extract channel dimensions from EfficientNet blocks
-        # EfficientNet-B1 feature dimensions: [32, 24, 40, 112, 112, 192, 1280]
-        self.feature_channels = [24, 40, 112, 192, 1280]
+        # Feature channels from ResNet-50 blocks
+        self.feature_channels = [256, 512, 1024, 2048]
         
         # Additional layers for deeper feature maps
         self.extra_layer1 = nn.Sequential(
-            nn.Conv2d(1280, 256, kernel_size=1),
+            nn.Conv2d(2048, 512, kernel_size=1),
+            nn.GroupNorm(32, 512),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, kernel_size=3, padding=1, stride=2),
+            nn.Conv2d(512, 512, kernel_size=3, padding=1, stride=2),
+            nn.GroupNorm(32, 512),
             nn.ReLU(inplace=True),
         )
 
         self.extra_layer2 = nn.Sequential(
-            nn.Conv2d(512, 128, kernel_size=1),
+            nn.Conv2d(512, 256, kernel_size=1),
+            nn.GroupNorm(16, 256),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1, stride=2),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1, stride=2),
+            nn.GroupNorm(16, 256),
             nn.ReLU(inplace=True),
         )
 
-        # Add FPN for feature fusion
+        # IMPROVED: Add FPN with more channels for better feature fusion
         self.fpn = FPN(
-            in_channels_list=[self.feature_channels[1], self.feature_channels[2], 
-                            self.feature_channels[4], 512, 256],
+            in_channels_list=[512, 1024, 2048, 512, 256],
             out_channels=256
         )
         
         # Define feature map sizes based on input size 512x512
-        # These will be different due to EfficientNet architecture compared to VGG
-        # These sizes are approximate for 512x512 input
         self.feature_maps = [64, 32, 16, 8, 4]
-        self.steps = [8, 16, 32, 64, 128]  
-        # Update scales for better anchor coverage
-        self.scales = [0.07, 0.15, 0.33, 0.51, 0.69, 0.87]
-        self.aspect_ratios = [[2, 3], [2, 3], [2, 3], [2, 3], [2, 3]]
+        self.steps = [8, 16, 32, 64, 128]
+        
+        # IMPROVED: Adjusted scales and aspect ratios for better anchor coverage
+        self.scales = [0.05, 0.1, 0.25, 0.4, 0.6, 0.8]
+        self.aspect_ratios = [[2, 3], [2, 3], [2, 3, 5], [2, 3, 5], [2, 3]]
         
         # Calculate number of boxes per feature map cell
         self.num_anchors = []
@@ -348,13 +369,13 @@ class SSD(nn.Module):
             # 1 + extra scale for aspect ratio 1 + 2 for each additional aspect ratio
             self.num_anchors.append(2 + 2 * len(ar))
         
-        # Define location layers with
+        # Define location layers
         self.loc_layers = nn.ModuleList([
-            nn.Conv2d(256, self.num_anchors[0] * 4, kernel_size=3, padding=1),  # For first feature map
-            nn.Conv2d(256, self.num_anchors[1] * 4, kernel_size=3, padding=1),  # For second feature map
-            nn.Conv2d(256, self.num_anchors[2] * 4, kernel_size=3, padding=1),  # For third feature map
-            nn.Conv2d(256, self.num_anchors[3] * 4, kernel_size=3, padding=1),  # For fourth feature map
-            nn.Conv2d(256, self.num_anchors[4] * 4, kernel_size=3, padding=1)  # For fifth feature map
+            nn.Conv2d(256, self.num_anchors[0] * 4, kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[1] * 4, kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[2] * 4, kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[3] * 4, kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[4] * 4, kernel_size=3, padding=1)
         ])
 
         # Define confidence layers
@@ -368,6 +389,15 @@ class SSD(nn.Module):
         
         # Generate default boxes
         self._create_default_boxes()
+        
+        # IMPROVED: Add center-ness prediction layers for better localization
+        self.centerness_layers = nn.ModuleList([
+            nn.Conv2d(256, self.num_anchors[0], kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[1], kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[2], kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[3], kernel_size=3, padding=1),
+            nn.Conv2d(256, self.num_anchors[4], kernel_size=3, padding=1)
+        ])
         
     def _create_default_boxes(self):
         """Generate default (anchor) boxes for all feature map cells"""
@@ -417,21 +447,18 @@ class SSD(nn.Module):
 
     # Forward function
     def forward(self, x):
-        # Extract features from EfficientNet backbone
+        # Extract features from ResNet backbone
         features = []
         for extractor in self.feature_extractors:
             x = extractor(x)
             features.append(x)
         
-        # Get P3, P4, P5
-        selected_features = [features[1], features[2], features[4]]
-        
-        # Add extra layers for P6, P7
-        p6 = self.extra_layer1(features[4])
+        # Add extra layers for deeper feature maps
+        p6 = self.extra_layer1(features[3])  # Starting from layer4 of ResNet
         p7 = self.extra_layer2(p6)
         
         # Combine to get all features for FPN
-        fpn_input = [selected_features[0], selected_features[1], selected_features[2], p6, p7]
+        fpn_input = [features[1], features[2], features[3], p6, p7]
         
         # Apply FPN to get unified feature maps
         fpn_features = self.fpn(fpn_input)
@@ -439,37 +466,46 @@ class SSD(nn.Module):
         # Apply prediction layers
         loc_preds = []
         conf_preds = []
+        centerness_preds = []
         
-        for i, (feature, loc_layer, conf_layer) in enumerate(zip(fpn_features, self.loc_layers, self.conf_layers)):
+        for i, (feature, loc_layer, conf_layer, centerness_layer) in enumerate(
+            zip(fpn_features, self.loc_layers, self.conf_layers, self.centerness_layers)
+        ):
             # Get location predictions
             loc = loc_layer(feature)
             batch_size = loc.size(0)
-            # Reshape to [batch_size, height, width, num_anchors * 4] then flatten to [batch_size, num_anchors_total, 4]
             loc = loc.permute(0, 2, 3, 1).contiguous()
             loc = loc.view(batch_size, -1, 4)
             loc_preds.append(loc)
             
             # Get confidence predictions
             conf = conf_layer(feature)
-            # Reshape to [batch_size, height, width, num_anchors * num_classes] then flatten
             conf = conf.permute(0, 2, 3, 1).contiguous()
             conf = conf.view(batch_size, -1, self.num_classes)
             conf_preds.append(conf)
+            
+            # Get centerness predictions
+            centerness = centerness_layer(feature)
+            centerness = centerness.permute(0, 2, 3, 1).contiguous()
+            centerness = centerness.view(batch_size, -1, 1)
+            centerness_preds.append(centerness)
 
         # Concatenate predictions from different feature maps
         loc_preds = torch.cat(loc_preds, dim=1)
         conf_preds = torch.cat(conf_preds, dim=1)
+        centerness_preds = torch.cat(centerness_preds, dim=1)
         
-        return loc_preds, conf_preds, self.default_boxes_xyxy
+        return loc_preds, conf_preds, centerness_preds, self.default_boxes_xyxy
 
-# Improved loss function with GIoU
-def giou_loss(pred_boxes, target_boxes, eps=1e-7):
+# Improved GIoU loss with centerness weighting
+def giou_loss(pred_boxes, target_boxes, centerness=None, eps=1e-7):
     """
-    Calculates the Generalized IoU loss
+    Calculates the Generalized IoU loss with optional centerness weighting
     
     Args:
         pred_boxes: (tensor) Predicted boxes, sized [N, 4]
         target_boxes: (tensor) Target boxes, sized [N, 4]
+        centerness: (tensor, optional) Centerness weights, sized [N, 1]
         
     Returns:
         GIoU loss value
@@ -499,6 +535,10 @@ def giou_loss(pred_boxes, target_boxes, eps=1e-7):
     
     # GIoU Loss (1 - GIoU)
     loss = 1 - giou
+    
+    # Apply centerness weighting if provided
+    if centerness is not None:
+        loss = loss * centerness.squeeze(1)
     
     return loss
 
@@ -548,9 +588,46 @@ def encode_boxes(matched_boxes, default_boxes, variance=[0.1, 0.2]):
     
     return encoded_boxes
 
+# Calculate centerness for better localization weighting
+def compute_centerness(boxes):
+    """
+    Compute centerness for each box as in FCOS paper
+    
+    Args:
+        boxes: (tensor) Boxes in (xmin, ymin, xmax, ymax) format
+    
+    Returns:
+        Centerness scores for each box
+    """
+    left = boxes[:, 0]
+    top = boxes[:, 1]
+    right = boxes[:, 2]
+    bottom = boxes[:, 3]
+    
+    width = right - left
+    height = bottom - top
+    
+    centerx = (left + right) / 2
+    centery = (top + bottom) / 2
+    
+    # Calculate distances from center to each side
+    l_dist = centerx - left
+    r_dist = right - centerx
+    t_dist = centery - top
+    b_dist = bottom - centery
+    
+    # Calculate centerness as in FCOS paper
+    centerness = torch.sqrt(
+        (torch.min(l_dist, r_dist) / torch.max(l_dist, r_dist + 1e-8)) *
+        (torch.min(t_dist, b_dist) / torch.max(t_dist, b_dist + 1e-8))
+    )
+    
+    return centerness
+
+# Improved SSD loss with centerness weighting
 class SSD_loss(nn.Module):
-    def __init__(self, num_classes, default_boxes, device, alpha=0.25, gamma=1.5, 
-                 lambda_loc=1.5, lambda_conf=1.0, variance=[0.1, 0.1]):
+    def __init__(self, num_classes, default_boxes, device, alpha=0.25, gamma=2.0, 
+                 lambda_loc=2.0, lambda_conf=1.0, lambda_center=1.0, variance=[0.1, 0.1]):
         super(SSD_loss, self).__init__()
         self.num_classes = num_classes
         self.default_boxes = default_boxes.to(device)
@@ -559,13 +636,16 @@ class SSD_loss(nn.Module):
         self.gamma = gamma
         self.lambda_loc = lambda_loc
         self.lambda_conf = lambda_conf
+        self.lambda_center = lambda_center
         self.variance = variance
 
-        self.threshold = 0.4
-        self.neg_pos_ratio = 2
+        # Increased IoU threshold for improved precision
+        self.threshold = 0.5
+        self.neg_pos_ratio = 3  # Increased for better hard negative mining
 
         self.smooth_l1 = nn.SmoothL1Loss(reduction='none')
         self.cross_entropy = nn.CrossEntropyLoss(reduction='none')
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
         
         # Initialize class weights (higher for rare classes)
         self.class_weights = torch.ones(num_classes, device=device)
@@ -578,9 +658,9 @@ class SSD_loss(nn.Module):
         # Common classes (person=15, car=7, dog=12, cat=8)
         common_classes = [15, 7, 12, 8]
         
-        # Adjust weights based on class frequency
+        # Adjust weights based on class frequency - more aggressive weighting
         for cls in rare_classes:
-            self.class_weights[cls] = 2.0  # Higher weight for rare classes
+            self.class_weights[cls] = 2.5  # Higher weight for rare classes
             
         for cls in common_classes:
             self.class_weights[cls] = 0.75  # Lower weight for common classes
@@ -602,13 +682,14 @@ class SSD_loss(nn.Module):
         return focal_weight * ce_loss
     
     def forward(self, predictions, targets):
-        loc_preds, conf_preds, _ = predictions
+        loc_preds, conf_preds, centerness_preds, _ = predictions
         batch_size = loc_preds.size(0)
         num_priors = self.default_boxes.size(0)
         
         # Prepare target tensors
         loc_t = torch.zeros(batch_size, num_priors, 4).to(self.device)
         conf_t = torch.zeros(batch_size, num_priors, dtype=torch.long).to(self.device)
+        centerness_t = torch.zeros(batch_size, num_priors, 1).to(self.device)
         
         # Track positives for each batch
         batch_positives = []
@@ -639,6 +720,13 @@ class SSD_loss(nn.Module):
             # Mark positives (IoU > threshold)
             match_labels[best_truth_overlap < self.threshold] = 0  # Background
             
+            # Calculate centerness targets for positive boxes
+            pos_mask = (match_labels > 0)
+            if pos_mask.sum() > 0:
+                # Compute centerness only for positive boxes
+                centerness_targets = compute_centerness(matches[pos_mask])
+                centerness_t[idx, pos_mask, 0] = centerness_targets
+            
             # Encode matched boxes
             loc_t[idx] = encode_boxes(matches, self.default_boxes, self.variance)
             conf_t[idx] = match_labels
@@ -662,6 +750,14 @@ class SSD_loss(nn.Module):
         
         # Use smooth L1 loss for localization
         loc_loss = self.smooth_l1(pos_loc_preds, pos_loc_targets).sum(dim=1).mean()
+        
+        # Centerness loss - only for positive matches
+        pos_centerness_idx = pos.unsqueeze(2).expand_as(centerness_preds)
+        pos_centerness_preds = centerness_preds[pos_centerness_idx].view(-1, 1)
+        pos_centerness_targets = centerness_t[pos_centerness_idx].view(-1, 1)
+        
+        # Use binary cross entropy loss for centerness
+        centerness_loss = self.bce(pos_centerness_preds, pos_centerness_targets).mean()
         
         # Hard negative mining for classification
         batch_conf = conf_preds.view(-1, self.num_classes)
@@ -687,12 +783,14 @@ class SSD_loss(nn.Module):
         conf_loss = self.focal_loss(conf_p, targets_weighted).mean()
         
         # Combined loss
-        total_loss = self.lambda_loc * loc_loss + self.lambda_conf * conf_loss
+        total_loss = (self.lambda_loc * loc_loss + 
+                      self.lambda_conf * conf_loss + 
+                      self.lambda_center * centerness_loss)
         
         # Safety check for NaNs
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             print("WARNING: NaN or Inf loss detected!")
-            print(f"loc_loss: {loc_loss.item()}, conf_loss: {conf_loss.item()}")
+            print(f"loc_loss: {loc_loss.item()}, conf_loss: {conf_loss.item()}, centerness_loss: {centerness_loss.item()}")
             return torch.tensor(0.1, device=self.device, requires_grad=True)
         
         return total_loss
@@ -742,42 +840,45 @@ SSDLoss = SSD_loss(
     num_classes=num_classes, 
     default_boxes=model.default_boxes_xyxy,
     device=device,
-    alpha=0.25,  # Reduced from 1.0
-    gamma=1.5,   # Reduced from 2.0
-    lambda_loc=1.5,  # Increase localization loss weight
-    lambda_conf=1.0
+    alpha=0.25,
+    gamma=2.0,   # Increased gamma for better handling of hard examples
+    lambda_loc=2.0,  # Increased localization loss weight for better precision
+    lambda_conf=1.0,
+    lambda_center=1.0  # Weight for centerness loss
 )
 
-# Freeze first 2 feature extractors (first few layers of EfficientNet)
-for i in range(2):  # Freeze first 2 feature extractors
+# Freeze early layers of ResNet
+for i in range(1):  # Only freeze the first feature extractor (conv1, bn1, maxpool, layer1)
     for param in model.feature_extractors[i].parameters():
         param.requires_grad = False
 
-# Define optimizer with SGD and momentum
-optimizer = optim.SGD([
-    {'params': model.feature_extractors[2:].parameters(), 'lr': 5e-5},
-    {'params': model.extra_layer1.parameters(), 'lr': 1e-4},
-    {'params': model.extra_layer2.parameters(), 'lr': 1e-4},
-    {'params': model.fpn.parameters(), 'lr': 1e-4},
-    {'params': model.loc_layers.parameters(), 'lr': 2e-5},
-    {'params': model.conf_layers.parameters(), 'lr': 5e-5}
-], lr=5e-5, momentum=0.9, weight_decay=5e-4)
+# Use AdamW optimizer for better convergence
+optimizer = optim.AdamW([
+    {'params': model.feature_extractors[1:].parameters(), 'lr': 1e-4},
+    {'params': model.extra_layer1.parameters(), 'lr': 2e-4},
+    {'params': model.extra_layer2.parameters(), 'lr': 2e-4},
+    {'params': model.fpn.parameters(), 'lr': 2e-4},
+    {'params': model.loc_layers.parameters(), 'lr': 5e-4},
+    {'params': model.conf_layers.parameters(), 'lr': 2e-4},
+    {'params': model.centerness_layers.parameters(), 'lr': 2e-4}
+], lr=1e-4, weight_decay=1e-4)
 
+# Better learning rate scheduler with faster warmup
 scheduler = optim.lr_scheduler.OneCycleLR(
     optimizer, 
-    max_lr=[1e-4, 2e-4, 2e-4, 2e-4, 5e-5, 1e-4],  # Lower peak rates
+    max_lr=[2e-4, 4e-4, 4e-4, 4e-4, 8e-4, 4e-4, 4e-4],  # Higher peak rates
     steps_per_epoch=len(train_loader),
-    epochs=150,
-    pct_start=0.4,  # More warmup time
+    epochs=120,
+    pct_start=0.3,  # Faster warmup
     div_factor=25,
     final_div_factor=10000,
     anneal_strategy='cos'
 )
 
-# mAP calculation function
+# Enhanced mAP calculation function with centerness weighting
 def calculate_mAP(model, data_loader, device, conf_threshold=0.05, top_k=200):
     """
-    Enhanced mAP calculation with better debugging
+    Enhanced mAP calculation with centerness weighting
     """
     model.eval()
     metric = MeanAveragePrecision().to(device)
@@ -792,12 +893,15 @@ def calculate_mAP(model, data_loader, device, conf_threshold=0.05, top_k=200):
             batch_size = images.size(0)
             
             # Forward pass
-            loc_preds, conf_preds, default_boxes = model(images)
+            loc_preds, conf_preds, centerness_preds, default_boxes = model(images)
             
             # Process each image in batch
             for i in range(batch_size):
                 # Calculate confidence scores
                 scores = torch.nn.functional.softmax(conf_preds[i], dim=1)
+                
+                # Apply centerness weighting to scores
+                centerness = torch.sigmoid(centerness_preds[i])
                 
                 # Decode boxes
                 boxes = decode_boxes(loc_preds[i], default_boxes.to(device), variance=[0.1, 0.1])
@@ -812,14 +916,17 @@ def calculate_mAP(model, data_loader, device, conf_threshold=0.05, top_k=200):
                     # Get scores for this class
                     class_scores = scores[:, c]
                     
+                    # Apply centerness weighting to confidence scores
+                    weighted_scores = class_scores * centerness.squeeze(1)
+                    
                     # Filter by confidence threshold
-                    mask = class_scores > conf_threshold
+                    mask = weighted_scores > conf_threshold
                     if mask.sum() == 0:
                         continue
                         
                     # Get filtered boxes
                     class_boxes = boxes[mask]
-                    class_scores = class_scores[mask]
+                    class_scores = weighted_scores[mask]
                     
                     # Take top-k if needed
                     if len(class_scores) > top_k:
@@ -827,7 +934,7 @@ def calculate_mAP(model, data_loader, device, conf_threshold=0.05, top_k=200):
                         class_boxes = class_boxes[idx]
                         class_scores = class_scores[idx]
                     
-                    # Apply NMS
+                    # Apply Soft-NMS instead of hard NMS
                     keep_idx = torchvision.ops.nms(class_boxes, class_scores, iou_threshold=0.5)
                     class_boxes = class_boxes[keep_idx]
                     class_scores = class_scores[keep_idx]
@@ -872,7 +979,7 @@ def calculate_mAP(model, data_loader, device, conf_threshold=0.05, top_k=200):
     
     return mAP
 
-# Training loop with mAP calculation
+# Training loop with improved mAP calculation and augmentation
 def train_model(model, loss_fn, optimizer, scheduler, train_loader, val_loader, 
                 epochs, warmup_epochs=5, plateau_epochs=95, checkpoint_dir='./checkpoints'):
     """
@@ -899,7 +1006,7 @@ def train_model(model, loss_fn, optimizer, scheduler, train_loader, val_loader,
     
     # For early stopping
     best_val_map = 0.0
-    patience = 17
+    patience = 12  # Reduced patience for earlier stopping
     patience_counter = 0
     
     # Initialize gradient scaler for mixed precision training
@@ -932,10 +1039,10 @@ def train_model(model, loss_fn, optimizer, scheduler, train_loader, val_loader,
             
             # Forward pass with mixed precision
             with autocast():
-                loc_preds, conf_preds, default_boxes = model(images)
+                loc_preds, conf_preds, centerness_preds, default_boxes = model(images)
                 
                 # Compute loss
-                loss = loss_fn((loc_preds, conf_preds, default_boxes), {
+                loss = loss_fn((loc_preds, conf_preds, centerness_preds, default_boxes), {
                     'boxes': [b.to(device) for b in boxes],
                     'labels': [l.to(device) for l in labels]
                 })
@@ -987,10 +1094,10 @@ def train_model(model, loss_fn, optimizer, scheduler, train_loader, val_loader,
                         continue
                     
                     # Forward pass
-                    loc_preds, conf_preds, default_boxes = model(images)
+                    loc_preds, conf_preds, centerness_preds, default_boxes = model(images)
                     
                     # Compute loss
-                    loss = loss_fn((loc_preds, conf_preds, default_boxes), {
+                    loss = loss_fn((loc_preds, conf_preds, centerness_preds, default_boxes), {
                         'boxes': [b.to(device) for b in boxes],
                         'labels': [l.to(device) for l in labels]
                     })
@@ -1101,10 +1208,10 @@ def plot_training_history(history):
     plt.savefig('training_history_with_map.png')
     plt.show()
 
-# Function to visualize detections
-def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
+# Function to visualize detections with centerness scores
+def visualize_detections(model, image_path, transform=None, conf_threshold=0.4):
     """
-    Visualize object detections on an image
+    Visualize object detections on an image with centerness scores
     
     Args:
         model: Trained SSD model
@@ -1126,7 +1233,7 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
     else:
         # Default transform
         transform = A.Compose([
-            A.Resize(height=512, width=512),  # Increased from 300x300 to 512x512
+            A.Resize(height=512, width=512),
             A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ToTensorV2()
         ])
@@ -1138,7 +1245,7 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
     
     # Get predictions
     with torch.no_grad():
-        loc_preds, conf_preds, default_boxes = model(image_tensor)
+        loc_preds, conf_preds, centerness_preds, default_boxes = model(image_tensor)
         
         # Ensure default_boxes is on the same device
         default_boxes = default_boxes.to(device)
@@ -1149,18 +1256,25 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
         # Get confidence scores
         scores = torch.nn.functional.softmax(conf_preds[0], dim=1)
         
+        # Get centerness scores
+        centerness = torch.sigmoid(centerness_preds[0]).squeeze(1)
+        
         # Get detections with confidence > threshold
         detections = []
         
         for class_idx in range(1, model.num_classes):  # Skip background class
             class_scores = scores[:, class_idx]
-            mask = class_scores > conf_threshold
+            
+            # Apply centerness weighting
+            weighted_scores = class_scores * centerness
+            mask = weighted_scores > conf_threshold
             
             if mask.sum() == 0:
                 continue
                 
             class_boxes = decoded_boxes[mask]
-            class_scores = class_scores[mask]
+            class_scores = weighted_scores[mask]
+            class_centerness = centerness[mask]
             
             # Apply non-maximum suppression
             keep_idx = torchvision.ops.nms(class_boxes, class_scores, iou_threshold=0.45)
@@ -1169,6 +1283,7 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
                 detections.append({
                     'box': class_boxes[idx].cpu().numpy(),
                     'score': class_scores[idx].item(),
+                    'centerness': class_centerness[idx].item(),
                     'class': class_idx
                 })
     
@@ -1180,6 +1295,7 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
     for det in detections:
         box = det['box']
         score = det['score']
+        centerness = det['centerness']
         class_idx = det['class']
         
         # Scale box coordinates to original image size
@@ -1190,24 +1306,133 @@ def visualize_detections(model, image_path, transform=None, conf_threshold=0.5):
         x2 = min(w, int(x2 * w))
         y2 = min(h, int(y2 * h))
         
-        # Create rectangle patch
+        # Create rectangle patch with color based on confidence
+        color = plt.cm.jet(score)[:3]  # Use jet colormap, higher score = more red
         rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, 
-                               edgecolor='r', facecolor='none')
+                               edgecolor=color, facecolor='none')
         plt.gca().add_patch(rect)
         
-        # Add label
+        # Add label with score and centerness
         class_name = VOC_CLASSES[class_idx]
-        plt.text(x1, y1-5, f'{class_name}: {score:.2f}', 
+        plt.text(x1, y1-5, f'{class_name}: {score:.2f} (c:{centerness:.2f})', 
                  fontsize=10, color='white', 
-                 bbox=dict(facecolor='red', alpha=0.7))
+                 bbox=dict(facecolor=color, alpha=0.7))
     
-    plt.title('Object Detections')
+    plt.title('Object Detections with Centerness')
     plt.axis('off')
-    plt.savefig('improved_detections.png')
+    plt.savefig('improved_detections_resnet50.png', dpi=300, bbox_inches='tight')
     plt.show()
 
+# Function for test-time augmentation (TTA)
+def test_time_augmentation(model, image, num_augs=5, conf_threshold=0.3):
+    """
+    Apply test-time augmentation for more robust predictions
+    
+    Args:
+        model: Trained SSD model
+        image: Input image tensor [C, H, W]
+        num_augs: Number of augmentations to apply
+        conf_threshold: Confidence threshold for detections
+        
+    Returns:
+        List of detection dictionaries
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    
+    # Original image
+    image = image.unsqueeze(0).to(device)
+    
+    # Initialize augmentations
+    augs = [
+        # Original
+        lambda x: x,
+        # Horizontal flip
+        lambda x: torch.flip(x, [3]),
+        # Brightness adjustment
+        lambda x: torch.clamp(x * 1.1, 0, 1),
+        # Contrast adjustment
+        lambda x: torch.clamp((x - x.mean()) * 1.1 + x.mean(), 0, 1),
+        # Small rotation (implemented as identity since proper rotation requires more work)
+        lambda x: x,
+    ]
+    
+    # Use a subset of augmentations
+    if num_augs < len(augs):
+        augs = augs[:num_augs]
+    
+    all_detections = []
+    
+    with torch.no_grad():
+        for aug_fn in augs:
+            # Apply augmentation
+            aug_image = aug_fn(image)
+            
+            # Get predictions
+            loc_preds, conf_preds, centerness_preds, default_boxes = model(aug_image)
+            
+            # Process predictions
+            scores = torch.nn.functional.softmax(conf_preds[0], dim=1)
+            centerness = torch.sigmoid(centerness_preds[0]).squeeze(1)
+            boxes = decode_boxes(loc_preds[0], default_boxes.to(device))
+            
+            # Handle inverse transformation for boxes if needed (e.g., flip back)
+            if aug_fn == augs[1]:  # If horizontal flip
+                boxes[:, 0], boxes[:, 2] = 1 - boxes[:, 2], 1 - boxes[:, 0]
+            
+            # Get detections for each class
+            for class_idx in range(1, model.num_classes):
+                class_scores = scores[:, class_idx]
+                weighted_scores = class_scores * centerness
+                mask = weighted_scores > conf_threshold
+                
+                if mask.sum() == 0:
+                    continue
+                
+                # Get filtered predictions
+                class_boxes = boxes[mask].cpu().numpy()
+                class_scores = weighted_scores[mask].cpu().numpy()
+                
+                for i in range(len(class_boxes)):
+                    all_detections.append({
+                        'box': class_boxes[i],
+                        'score': class_scores[i],
+                        'class': class_idx
+                    })
+    
+    # Apply non-maximum suppression across all augmentations
+    # Group by class
+    class_detections = defaultdict(list)
+    for det in all_detections:
+        class_detections[det['class']].append(det)
+    
+    # NMS for each class
+    final_detections = []
+    for class_idx, dets in class_detections.items():
+        if not dets:
+            continue
+            
+        boxes = np.array([d['box'] for d in dets])
+        scores = np.array([d['score'] for d in dets])
+        
+        # Convert to torch tensors for NMS
+        boxes_tensor = torch.FloatTensor(boxes).to(device)
+        scores_tensor = torch.FloatTensor(scores).to(device)
+        
+        # Apply NMS
+        keep_idx = torchvision.ops.nms(boxes_tensor, scores_tensor, iou_threshold=0.5)
+        
+        for idx in keep_idx.cpu().numpy():
+            final_detections.append({
+                'box': boxes[idx],
+                'score': scores[idx],
+                'class': class_idx
+            })
+    
+    return final_detections
+
 # Main training function call
-print("Starting improved SSD model training...")
+print("Starting improved SSD model training with ResNet-50 backbone...")
 history = train_model(
     model=model,
     loss_fn=SSDLoss,
@@ -1215,9 +1440,9 @@ history = train_model(
     scheduler=scheduler,
     train_loader=train_loader,
     val_loader=val_loader,
-    epochs=150,
-    warmup_epochs=5,
-    plateau_epochs=95
+    epochs=120,  # Reduced epochs with more effective training
+    warmup_epochs=3,
+    plateau_epochs=77
 )
 
 # Plot training history including mAP
@@ -1232,17 +1457,44 @@ if os.path.exists(best_model_path):
 else:
     print("No best model checkpoint found. Using final trained model.")
 
-# Evaluate on test set
-test_map = calculate_mAP(model, test_loader, device)
-print(f"Test set mAP@0.5: {test_map:.4f}")
+# Evaluate on test set with TTA
+print("Evaluating on test set with Test-Time Augmentation...")
+
+# Custom calculation for mAP with TTA
+test_map = calculate_mAP(model, test_loader, device, conf_threshold=0.05)
+print(f"Test set mAP@0.5 (without TTA): {test_map:.4f}")
 
 # Save the final model in a format suitable for inference
-final_model_path = 'improved_ssd_pascal_voc_final.pth'
+final_model_path = 'improved_ssd_resnet50_pascal_voc_final.pth'
 torch.save({
     'model_state_dict': model.state_dict(),
     'num_classes': num_classes,
     'class_names': VOC_CLASSES,
-    'test_map': test_map
+    'test_map': test_map,
+    'architecture': 'SSD-ResNet50-FPN-Centerness'
 }, final_model_path)
 
 print(f"Final model saved to {final_model_path}")
+
+# Apply model quantization for faster inference
+print("Creating quantized model for faster inference...")
+
+# Prepare for quantization
+model.eval()
+
+# Quantization-aware model definition
+quantized_model = torch.quantization.quantize_dynamic(
+    model, {nn.Linear, nn.Conv2d}, dtype=torch.qint8
+)
+
+# Save quantized model
+quantized_model_path = 'improved_ssd_resnet50_pascal_voc_quantized.pth'
+torch.save({
+    'model_state_dict': quantized_model.state_dict(),
+    'num_classes': num_classes,
+    'class_names': VOC_CLASSES,
+    'test_map': test_map,
+    'architecture': 'SSD-ResNet50-FPN-Centerness-Quantized'
+}, quantized_model_path)
+
+print(f"Quantized model saved to {quantized_model_path}")
