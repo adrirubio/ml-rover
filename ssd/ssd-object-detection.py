@@ -213,7 +213,7 @@ voc_root = '/home/adrian/ssd/VOCdevkit/VOCdevkit'
 dataset_07 = PascalVOCDataset(
     voc_root, year='2007', image_set='trainval',
     transforms=train_transforms,
-    use_mosaic=True
+    use_mosaic=False
 )
 dataset_12 = PascalVOCDataset(
     voc_root, year='2012', image_set='trainval',
