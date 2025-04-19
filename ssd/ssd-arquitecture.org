@@ -1,8 +1,8 @@
 # SSD Arquitecture
 
-- Model: SSD512
-- Base Network: ResNet-50
-- Input Resolution: 512x512
+- Model: SSD300
+- Base Network: ResNet‑50 pretrained on ImageNet1K
+- Input Resolution: 300x300
 - Feature Maps: 6 scales for multi-scale detection
-- Default Boxes: ~24000 per image
+- Default Boxes: ~11600 per image
 - Output: Class scores and box offsets for each default box
