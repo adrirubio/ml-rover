@@ -79,6 +79,7 @@ class PascalVOCDataset(Dataset):
             img, boxes, labels = self._load_mosaic(index)
         else:
             img, boxes, labels = self.load_image_and_labels(index)
+        
         sample = {'image': img, 'bboxes': boxes, 'labels': labels}
         if self.transforms:
             sample = self.transforms(**sample)
@@ -206,8 +207,6 @@ def custom_collate_fn(batch):
     }
 
 # Combine VOC2007 + VOC2012 trainval (mosaic off)
-voc_root = '/home/adrian/ssd/VOCdevkit/VOCdevkit'
-
 voc_root = '/home/adrian/ssd/VOCdevkit/VOCdevkit'
 
 dataset_07 = PascalVOCDataset(
