@@ -808,6 +808,7 @@ plot_training_history(history)
 if os.path.exists('checkpoints/best_model.pth'):
     model.load_state_dict(torch.load('checkpoints/best_model.pth'))
     print("Loaded best model.")
+
 # test
 test_map50 = evaluate_map50(model, test_loader, device)
 print(f"Test mAP@0.50: {test_map50:.4f}")
