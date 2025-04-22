@@ -1,8 +1,56 @@
 """
 SSD300 Random VOC2007 Inference
 
+This script runs inference on a random image from the Pascal VOC 2007 dataset
+using the pre-trained SSD300 model.
+
 Usage:
-    python ssd_voc_infer.py
+    python Pascal-VOC-inference.py
+
+Requirements:
+    - Pascal VOC 2007 dataset (trainval + test)
+    - Pre-trained SSD model weights
+    - Install dependencies
+
+How to set up:
+
+1. Download the Pascal VOC 2007 dataset:
+
+    Create a directory for the dataset:
+        mkdir -p /path/to/VOCdevkit
+        cd /path/to/VOCdevkit
+
+    Download and extract the dataset:
+        wget http://host.robots.ox.ac.uk/pascal/VOC/voc2007/VOCtrainval_06-Nov-2007.tar
+        wget http://host.robots.ox.ac.uk/pascal/VOC/voc2007/VOCtest_06-Nov-2007.tar
+        tar -xf VOCtrainval_06-Nov-2007.tar
+        tar -xf VOCtest_06-Nov-2007.tar
+
+    Set the dataset path in the script:
+        VOC_ROOT = "/path/to/VOCdevkit/VOCdevkit"
+
+2. Download SSD300 model weights:
+
+    Download the 'ssd_weights.pth' file from:
+        https://huggingface.co/pro-grammer/SSD/
+
+    Set the weights path in the script:
+        WEIGHTS_PATH = "/path/to/your/ssd_weights.pth"
+
+3. Install dependencies:
+    - **Python Libraries**: The following libraries are required for running this script:
+        - `torch`
+        - `torchvision`
+        - `albumentations`
+        - `matplotlib`
+        - `PIL`
+  
+  You can install the necessary dependencies using `pip`:
+
+  ```bash
+  pip install torch torchvision albumentations matplotlib pillow
+
+Make sure to update VOC_ROOT and WEIGHTS_PATH accordingly before running the script.
 """
 
 import os, random
@@ -16,8 +64,8 @@ from albumentations.pytorch import ToTensorV2
 from torchvision.ops import nms
 
 # Paths & classes
-VOC_ROOT     = "/home/adrian/Documents/VOCdevkit/VOCdevkit"
-WEIGHTS_PATH = "/home/adrian/Documents/model-weights/ssd_weights.pth"
+VOC_ROOT = "/home/adrian/Documents/VOCdevkit/VOCdevkit" # Modify for your own use case
+WEIGHTS_PATH = "/home/adrian/Documents/model-weights/ssd_weights.pth" # Modify for your own use case
 VOC_CLASSES = (
     'background','aeroplane','bicycle','bird','boat','bottle','bus',
     'car','cat','chair','cow','diningtable','dog','horse','motorbike',

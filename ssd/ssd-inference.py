@@ -1,6 +1,29 @@
 """
 SSD300 Inference
 
+This script runs inference on an image using the pre-trained SSD300 model. 
+You can specify the image path and model weights via command-line arguments.
+
+## Requirements
+- SSD Weights: You will need to download the pre-trained SSD model weights (`ssd_weights.pth`) to use this script.
+  
+  You can download the SSD300 model weights from the following link:
+    https://huggingface.co/pro-grammer/SSD/
+
+  After downloading, make sure to save the weights file in a directory you can easily reference.
+
+- **Python Libraries**: The following libraries are required for running this script:
+  - `torch`
+  - `torchvision`
+  - `albumentations`
+  - `matplotlib`
+  - `PIL`
+  
+  You can install the necessary dependencies using `pip`:
+
+  ```bash
+  pip install torch torchvision albumentations matplotlib pillow
+
 Usage:
     python ssd-inference.py \
       --image /path/to/image.jpg \
