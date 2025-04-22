@@ -44,13 +44,11 @@ print(f"Number of classes: {num_classes}")
 
 # Define Pascal VOC Dataset with improved capabilities
 class PascalVOCDataset(Dataset):
-    def __init__(self, root, year='2007', image_set='train', transforms=None, use_mosaic=False, mosaic_prob=0.5):
+    def __init__(self, root, year='2007', image_set='train', transforms=None):
         self.root = root
         self.year = year
         self.image_set = image_set
         self.transforms = transforms
-        self.use_mosaic = use_mosaic and image_set == 'train'
-        self.mosaic_prob = mosaic_prob
         
         self.images_dir = os.path.join(root, f'VOC{year}', 'JPEGImages')
         self.annotations_dir = os.path.join(root, f'VOC{year}', 'Annotations')
@@ -75,10 +73,7 @@ class PascalVOCDataset(Dataset):
         return img, boxes, labels
     
     def __getitem__(self, index):
-        if self.use_mosaic and random.random() < self.mosaic_prob:
-            img, boxes, labels = self._load_mosaic(index)
-        else:
-            img, boxes, labels = self.load_image_and_labels(index)
+        img, boxes, labels = self.load_image_and_labels(index)
         
         sample = {'image': img, 'bboxes': boxes, 'labels': labels}
         if self.transforms:
@@ -100,55 +95,6 @@ class PascalVOCDataset(Dataset):
             'boxes': torch.FloatTensor(normalized_boxes) if normalized_boxes else torch.zeros((0, 4)),
             'labels': torch.LongTensor(sample['labels']) if sample['labels'] else torch.zeros(0, dtype=torch.long)
         }
-    
-    def _load_mosaic(self, index):
-        indices = [index] + [random.randint(0, len(self.ids) - 1) for _ in range(3)]
-        img_size = 1024
-        cx, cy = img_size // 2, img_size // 2
-        mosaic_img = np.zeros((img_size, img_size, 3), dtype=np.uint8)
-        mosaic_boxes = []
-        mosaic_labels = []
-        positions = [
-            [0, 0, cx, cy],
-            [cx, 0, img_size, cy],
-            [0, cy, cx, img_size],
-            [cx, cy, img_size, img_size]
-        ]
-        for i, idx in enumerate(indices):
-            img, boxes, labels = self.load_image_and_labels(idx)
-            h, w = img.shape[:2]
-            x1a, y1a, x2a, y2a = positions[i]
-            h_scale, w_scale = (y2a - y1a) / h, (x2a - x1a) / w
-            img_resized = cv2.resize(img, (x2a - x1a, y2a - y1a))
-            mosaic_img[y1a:y2a, x1a:x2a] = img_resized
-            if len(boxes) > 0:
-                if not isinstance(boxes, np.ndarray):
-                    boxes = np.array(boxes)
-                boxes_scaled = boxes.copy()
-                boxes_scaled[:, 0] = w_scale * boxes[:, 0] + x1a
-                boxes_scaled[:, 1] = h_scale * boxes[:, 1] + y1a
-                boxes_scaled[:, 2] = w_scale * boxes[:, 2] + x1a
-                boxes_scaled[:, 3] = h_scale * boxes[:, 3] + y1a
-                for box, label in zip(boxes_scaled, labels):
-                    box_width = box[2] - box[0]
-                    box_height = box[3] - box[1]
-                    original_area = box_width * box_height
-                    clipped_box = [
-                        max(0, box[0]),
-                        max(0, box[1]),
-                        min(img_size, box[2]),
-                        min(img_size, box[3])
-                    ]
-                    clipped_width = clipped_box[2] - clipped_box[0]
-                    clipped_height = clipped_box[3] - clipped_box[1]
-                    clipped_area = clipped_width * clipped_height
-                    if (clipped_width > 0 and clipped_height > 0 and 
-                        clipped_area / (original_area + 1e-8) > 0.25):
-                        mosaic_boxes.append(clipped_box)
-                        mosaic_labels.append(label)
-        if len(mosaic_boxes) > 0:
-            mosaic_boxes = np.array(mosaic_boxes)
-        return mosaic_img, mosaic_boxes, mosaic_labels
     
     def _parse_voc_xml(self, node):
         boxes = []
@@ -206,18 +152,16 @@ def custom_collate_fn(batch):
         'labels': labels
     }
 
-# Combine VOC2007 + VOC2012 trainval (mosaic off)
+# Combine VOC2007 + VOC2012 trainval
 voc_root = '/home/adrian/ssd/VOCdevkit/VOCdevkit'
 
 dataset_07 = PascalVOCDataset(
     voc_root, year='2007', image_set='trainval',
-    transforms=train_transforms,
-    use_mosaic=False
+    transforms=train_transforms
 )
 dataset_12 = PascalVOCDataset(
     voc_root, year='2012', image_set='trainval',
-    transforms=train_transforms,
-    use_mosaic=False
+    transforms=train_transforms
 )
 train_dataset = ConcatDataset([dataset_07, dataset_12])
 
@@ -225,13 +169,11 @@ train_dataset = ConcatDataset([dataset_07, dataset_12])
 
 val_dataset = PascalVOCDataset(
     voc_root, year='2007', image_set='val',
-    transforms=val_transforms,
-    use_mosaic=False
+    transforms=val_transforms
 )
 test_dataset = PascalVOCDataset(
     voc_root, year='2007', image_set='test',
-    transforms=val_transforms,
-    use_mosaic=False
+    transforms=val_transforms
 )
 
 # Dataloaders
