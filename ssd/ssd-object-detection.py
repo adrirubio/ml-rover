@@ -271,7 +271,7 @@ class SSD(nn.Module):
         # feature map sizes (H=W)
         self.feature_maps = [f.shape[2] for f in feats]
         # SSD300 scales & ratios
-        self.scales       = [0.2, 0.34, 0.48, 0.62, 0.76, 0.9]
+        self.scales = [0.2, 0.34, 0.48, 0.62, 0.76, 0.9]
         self.aspect_ratios= [[2, 0.5]] * 6
 
         # 3a) create & register default boxes
@@ -300,9 +300,9 @@ class SSD(nn.Module):
 
         # 3b) build prediction heads
         num_anchors = [2 + 2*len(ar) for ar in self.aspect_ratios]
-        channels    = [f.shape[1] for f in feats]
+        channels = [f.shape[1] for f in feats]
         for ch, a in zip(channels, num_anchors):
-            self.loc_layers.append (nn.Conv2d(ch, a*4,          kernel_size=3, padding=1))
+            self.loc_layers.append (nn.Conv2d(ch, a*4, kernel_size=3, padding=1))
             self.conf_layers.append(nn.Conv2d(ch, a*self.num_classes, kernel_size=3, padding=1))
 
     def forward(self, x):
@@ -502,7 +502,7 @@ def evaluate_map50(model, data_loader, device):
                     if mask.sum()==0: continue
                     cls_boxes  = boxes[mask]
                     cls_scores = scores[mask,c]
-                    keep       = torchvision.ops.nms(cls_boxes, cls_scores, iou_threshold=0.45)
+                    keep = torchvision.ops.nms(cls_boxes, cls_scores, iou_threshold=0.45)
                     preds['boxes'].append(cls_boxes[keep].cpu())
                     preds['scores'].append(cls_scores[keep].cpu())
                     preds['labels'].append(torch.full((len(keep),), c, dtype=torch.int64))
